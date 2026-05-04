@@ -90,6 +90,29 @@ def _snake_case_gemini_thinking_config(config: dict | None) -> dict | None:
     return translated or None
 
 
+def _opencode_go_deepseek_reasoning_effort(
+    model: str,
+    reasoning_config: dict | None,
+) -> str | None:
+    """Return OpenCode Go's top-level DeepSeek reasoning_effort value."""
+    normalized_model = (model or "").strip().lower()
+    if not normalized_model.startswith("deepseek-v4-"):
+        return None
+
+    if reasoning_config and isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            return None
+        effort = str(reasoning_config.get("effort") or "medium").strip().lower()
+    else:
+        effort = "medium"
+
+    if effort in {"low", "medium", "high", "xhigh", "max"}:
+        return effort
+    if effort == "minimal":
+        return "low"
+    return "medium"
+
+
 def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if not normalized:
@@ -260,6 +283,7 @@ class ChatCompletionsTransport(ProviderTransport):
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
         reasoning_config = params.get("reasoning_config")
+        provider_name = str(params.get("provider_name") or "").strip().lower()
 
         if ephemeral is not None and max_tokens_fn:
             api_kwargs.update(max_tokens_fn(ephemeral))
@@ -310,13 +334,21 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        _opencode_go_effort = None
+        if provider_name == "opencode-go":
+            _opencode_go_effort = _opencode_go_deepseek_reasoning_effort(
+                model,
+                reasoning_config,
+            )
+            if _opencode_go_effort is not None:
+                api_kwargs["reasoning_effort"] = _opencode_go_effort
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
         is_openrouter = params.get("is_openrouter", False)
         is_nous = params.get("is_nous", False)
         is_github_models = params.get("is_github_models", False)
-        provider_name = str(params.get("provider_name") or "").strip().lower()
         base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
@@ -333,9 +365,13 @@ class ChatCompletionsTransport(ProviderTransport):
                 "type": "enabled" if _kimi_thinking_enabled else "disabled",
             }
 
-        # Reasoning. LM Studio is handled above via top-level reasoning_effort,
-        # so skip emitting extra_body.reasoning for it.
-        if params.get("supports_reasoning", False) and not params.get("is_lmstudio", False):
+        # Reasoning. LM Studio and OpenCode Go DeepSeek V4 are handled above via
+        # top-level reasoning_effort, so skip emitting extra_body.reasoning for them.
+        if (
+            params.get("supports_reasoning", False)
+            and not params.get("is_lmstudio", False)
+            and _opencode_go_effort is None
+        ):
             if is_github_models:
                 gh_reasoning = params.get("github_reasoning_extra")
                 if gh_reasoning is not None:
