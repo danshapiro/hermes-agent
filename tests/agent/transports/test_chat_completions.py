@@ -454,6 +454,48 @@ class TestChatCompletionsKimi:
         assert "type" not in kw["tools"][0]["function"]["parameters"]["properties"]["q"]
 
 
+class TestChatCompletionsOpenCodeGo:
+    """OpenCode Go DeepSeek V4 exposes reasoning_effort as a top-level field."""
+
+    def test_deepseek_v4_reasoning_effort_top_level(self, transport):
+        kw = transport.build_kwargs(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="opencode-go",
+            reasoning_config={"enabled": True, "effort": "max"},
+            supports_reasoning=True,
+        )
+        assert kw["reasoning_effort"] == "max"
+        assert "reasoning" not in kw.get("extra_body", {})
+
+    def test_deepseek_v4_xhigh_reasoning_effort_top_level(self, transport):
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="opencode-go",
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+        assert kw["reasoning_effort"] == "xhigh"
+
+    def test_deepseek_v4_reasoning_effort_omitted_when_disabled(self, transport):
+        kw = transport.build_kwargs(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="opencode-go",
+            reasoning_config={"enabled": False},
+        )
+        assert "reasoning_effort" not in kw
+
+    def test_non_deepseek_opencode_go_does_not_get_deepseek_effort(self, transport):
+        kw = transport.build_kwargs(
+            model="qwen3.6-plus",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_name="opencode-go",
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert "reasoning_effort" not in kw
+
+
 class TestChatCompletionsLmStudioReasoning:
     """LM Studio publishes per-model reasoning ``allowed_options``. When the
     user requests an effort the model can't honor (e.g. ``high`` on a
