@@ -312,6 +312,7 @@ class TestBuiltinDiscovery:
             "tools.send_message_tool",
             "tools.session_search_tool",
             "tools.skill_manager_tool",
+            "tools.skills_repo_tool",
             "tools.skills_tool",
             "tools.terminal_tool",
             "tools.todo_tool",
