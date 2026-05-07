@@ -34,7 +34,7 @@ _GIT_TIMEOUT = 30
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
 _CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # category: subdirectories only, no path separators
 _FRONTMATTER_NAME_RE = re.compile(r"^name\s*:\s*(.+)$", re.MULTILINE)
-_FM_NAME_CLEAN_RE = re.compile(r'(?:(?<=^)|(?<=\s))#.*$')  # strip YAML trailing comments only outside quotes
+_FM_NAME_CLEAN_RE = re.compile(r'(?:\s|^)#(?:[^{}\'"\\]*(?:(?:\"[^"]*\")|(?:\'[^\']*\'))?[^{}\'"\\]*)*$')  # unused now: kept for reference
 _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 
 
@@ -203,13 +203,30 @@ def _split_frontmatter(content: str) -> Optional[str]:
 
 
 def _normalize_frontmatter_name(raw_name: str) -> str:
-    """Normalize a frontmatter name value, stripping YAML comments then quotes."""
+    """Normalize a frontmatter name value, stripping YAML quotes and comments."""
     raw = raw_name.strip()
-    # Strip trailing YAML comments first (before quotes, since quotes may
-    # be inside comments or vice versa in canonicalization)
-    raw = _FM_NAME_CLEAN_RE.sub('', raw).strip()
-    if len(raw) >= 2 and ((raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'"))):
-        raw = raw[1:-1].strip()
+    # If quoted, extract content between quotes; comments after closing quote
+    # are implicitly excluded by the YAML parser.
+    if len(raw) >= 2 and raw[0] in ('"', "'"):
+        # Find the matching closing quote (skip escaped quotes)
+        quote = raw[0]
+        end = 1
+        while end < len(raw):
+            end = raw.find(quote, end)
+            if end == -1:
+                break
+            # Check for escaped quote (\" or '')
+            if end > 0 and (raw[end - 1] == '\\' or (quote == "'" and end + 1 < len(raw) and raw[end + 1] == "'")):
+                end += 1
+                continue
+            break
+        if end != -1:
+            return raw[1:end].strip()
+        # Unclosed quote: treat as raw
+    # Unquoted: strip trailing comments (# preceded by whitespace)
+    raw = re.sub(r'(\s)#\s.*$', r'\1', raw).strip()
+    # Handle # at position 0: strip everything from # to end
+    raw = re.sub(r'^#.*$', '', raw).strip()
     return raw
 
 
