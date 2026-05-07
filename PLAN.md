@@ -6,6 +6,8 @@ The WhatsApp bridge process crashes due to **discarded promise rejections** from
 
 ### Source Citations
 
+(*Line numbers below reference the pre-fix `bridge.js`. After the fix, guard sites are at lines 147, 174, 188, 374, 606, and 619.*)
+
 **Reconnection — `scripts/whatsapp-bridge/bridge.js:169`:**
 ```js
 setTimeout(startSocket, reason === 515 ? 1000 : 3000);
