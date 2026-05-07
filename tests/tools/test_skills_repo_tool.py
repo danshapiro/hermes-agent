@@ -229,6 +229,19 @@ class TestCreate:
         data = json.loads(result)
         assert "error" in data
         assert "collision" in data["error"].lower() or "already exists" in data["error"].lower()
+
+    def test_rejects_nested_category_basename_collision(self, temp_git_repo):
+        # Hermes has nested categories like skills/mlops/training/trl-fine-tuning/
+        # Create skills/mlops/training/my-skill/
+        content1 = "---\nname: nested-skill\n---\n# Nested"
+        (temp_git_repo / "skills" / "mlops" / "training" / "my-skill").mkdir(parents=True)
+        (temp_git_repo / "skills" / "mlops" / "training" / "my-skill" / "SKILL.md").write_text(content1)
+        # Try to create skills/my-skill/ (flat) — basename collision with nested path
+        content2 = "---\nname: flat-nested\n---\n# Flat"
+        result = _handle_create(temp_git_repo, "my-skill", content2)
+        data = json.loads(result)
+        assert "error" in data
+        assert "collision" in data["error"].lower() or "already exists" in data["error"].lower()
         assert "already used" in data["error"].lower() or "collision" in data["error"].lower()
 
 
@@ -331,7 +344,8 @@ class TestFindRepoDir:
         with patch("hermes_cli.config.cfg_get", return_value=None):
             assert _find_repo_dir() is None
 
-    def test_finds_repo_via_external_dirs(self, temp_git_repo):
+    def test_external_dirs_not_used_for_repo_discovery(self, temp_git_repo):
+        # external_dirs are read-only; repo discovery must use explicit repo_dir only
         repo_path = str(temp_git_repo)
         def mock_cfg_get(cfg, *keys, default=None):
             key_path = ".".join(keys)
@@ -342,7 +356,7 @@ class TestFindRepoDir:
             return default
         with patch("hermes_cli.config.cfg_get", side_effect=mock_cfg_get):
             result = _find_repo_dir()
-            assert result is not None
+            assert result is None, "external_dirs must not be used for writable repo discovery"
 
     def test_finds_repo_via_git_file_worktree(self, tmp_path):
         # Create a valid git repo with .git as a file (git worktree)
@@ -364,14 +378,11 @@ class TestFindRepoDir:
         )
         assert (worktree_path / ".git").is_file()  # worktree has .git as file
 
-        # mock config to return the worktree skills/ as external_dir
-        wt_skills = str(worktree_path / "skills")
+        # mock config to return the worktree path as skills.repo_dir
         def mock_cfg_get(cfg, *keys, default=None):
             key_path = ".".join(keys)
             if key_path == "skills.repo_dir":
-                return None
-            if key_path == "skills.external_dirs":
-                return [wt_skills]
+                return str(worktree_path)
             return default
         with patch("hermes_cli.config.cfg_get", side_effect=mock_cfg_get):
             result = _find_repo_dir()
