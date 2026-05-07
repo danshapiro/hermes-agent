@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT = 30
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
+_CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # category: subdirectories only, no path separators
+_FRONTMATTER_NAME_RE = re.compile(r"^name\s*:\s*(.+)$", re.MULTILINE)
 _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 
 # Minimal YAML frontmatter check: must start with '---' and have at least
@@ -161,30 +163,92 @@ def _validate_content_size(content: str) -> Optional[str]:
 
 
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
-    """Run security scan on a new skill. Returns error string or None."""
+    """Run security scan on a new skill. Returns error string or None.
+
+    No-op when skills.guard_agent_created is disabled (the default).
+    """
     try:
         from tools.skill_manager_tool import _guard_agent_created_enabled
         from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
-        if not _guard_agent_created_enabled():
-            return None
-        report = scan_skill(skill_dir, is_external=False)
-        allowed, _ = should_allow_install(report)
-        if not allowed:
-            return format_scan_report(report)
     except ImportError:
-        pass
+        return None
+    if not _guard_agent_created_enabled():
+        return None
+    try:
+        result = scan_skill(skill_dir, source="agent-created")
+        allowed, reason = should_allow_install(result)
+        if allowed is False:
+            report = format_scan_report(result)
+            return f"Security scan blocked this skill ({reason}):\n{report}"
+        if allowed is None:
+            report = format_scan_report(result)
+            logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
+            return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as exc:
         logger.warning("skipping security scan: %s", exc)
     return None
 
 
+def _extract_frontmatter_name_from_content(content: str) -> Optional[str]:
+    """Extract the 'name:' field from raw SKILL.md content frontmatter."""
+    m = _FRONTMATTER_NAME_RE.search(content)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extract_frontmatter_name(skill_dir: Path) -> Optional[str]:
+    """Extract the 'name:' field from SKILL.md frontmatter, or None."""
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.is_file():
+        return None
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    m = _FRONTMATTER_NAME_RE.search(content)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _scan_all_skill_names(repo_dir: Path) -> Dict[str, Path]:
+    """Scan all SKILL.md files in skills/ and return {frontmatter_name: dir_path}."""
+    names = {}
+    skills_root = repo_dir / "skills"
+    if not skills_root.is_dir():
+        return names
+    for skill_md in skills_root.rglob("SKILL.md"):
+        fm_name = _extract_frontmatter_name(skill_md.parent)
+        if fm_name:
+            names[fm_name] = skill_md.parent
+    return names
+
+
+def _validate_category(category: str) -> Optional[str]:
+    """Validate category name; returns error string or None."""
+    if not category or not category.strip():
+        return None  # empty category is fine (means no subdirectory)
+    category = category.strip()
+    if len(category) < 1:
+        return f"category name too short: {category!r}"
+    if len(category) > 64:
+        return f"category name too long: {category!r} (maximum 64 characters)"
+    if not _CATEGORY_RE.match(category):
+        return f"invalid category: {category!r} (use lowercase letters, digits, and hyphens; no path separators)"
+    return None
+
+
 def _check_name_unique_in_repo(repo_dir: Path, name: str,
-                                category: str = "") -> Optional[str]:
+                                category: str = "",
+                                frontmatter_name: Optional[str] = None) -> Optional[str]:
     """Check that name does not collide with an existing skill in the repo.
 
-    Checks under skills/<category>/<name> when category is set,
-    and also under skills/<name> for flat directory collisions.
+    Checks path-based collisions (same directory) AND frontmatter-name
+    collisions (different directory but same 'name:' in YAML frontmatter).
+    When frontmatter_name differs from the directory name, both are checked.
     """
+    # Path-based collision check
     if category:
         skill_path = repo_dir / "skills" / category / name
         flat_path = repo_dir / "skills" / name
@@ -196,6 +260,17 @@ def _check_name_unique_in_repo(repo_dir: Path, name: str,
         skill_path = repo_dir / "skills" / name
         if skill_path.is_dir():
             return f"skill {name!r} already exists in the repo at skills/{name}/"
+
+    # Frontmatter-name collision check (different directory, same 'name:' in frontmatter)
+    existing = _scan_all_skill_names(repo_dir)
+    check_names = {name}
+    if frontmatter_name and frontmatter_name != name:
+        check_names.add(frontmatter_name)
+    for n in check_names:
+        if n in existing:
+            rel = existing[n].relative_to(repo_dir)
+            return f"skill name {n!r} already used by {rel}/ (frontmatter name collision)"
+
     return None
 
 
@@ -350,6 +425,11 @@ def _handle_create(repo_dir: Path, name: str, content: str,
     if name_err:
         return json.dumps({"error": name_err})
 
+    # Validate category (prevent path traversal)
+    cat_err = _validate_category(category)
+    if cat_err:
+        return json.dumps({"error": cat_err})
+
     # Validate content
     if not content or not content.strip():
         return json.dumps({"error": "content is required for create"})
@@ -362,8 +442,11 @@ def _handle_create(repo_dir: Path, name: str, content: str,
     if size_err:
         return json.dumps({"error": size_err})
 
-    # Check name uniqueness in repo (with category awareness)
-    dup_err = _check_name_unique_in_repo(repo_dir, name, category)
+    # Extract frontmatter name for collision checking
+    fm_name = _extract_frontmatter_name_from_content(content)
+
+    # Check name uniqueness in repo (with category awareness and frontmatter check)
+    dup_err = _check_name_unique_in_repo(repo_dir, name, category, frontmatter_name=fm_name)
     if dup_err:
         return json.dumps({"error": dup_err})
 
