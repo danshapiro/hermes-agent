@@ -203,11 +203,13 @@ def _split_frontmatter(content: str) -> Optional[str]:
 
 
 def _normalize_frontmatter_name(raw_name: str) -> str:
-    """Normalize a frontmatter name value, stripping YAML quotes and comments."""
+    """Normalize a frontmatter name value, stripping YAML comments then quotes."""
     raw = raw_name.strip()
-    if len(raw) >= 2 and ((raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'"))):
-        raw = raw[1:-1]
+    # Strip trailing YAML comments first (before quotes, since quotes may
+    # be inside comments or vice versa in canonicalization)
     raw = _FM_NAME_CLEAN_RE.sub('', raw).strip()
+    if len(raw) >= 2 and ((raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'"))):
+        raw = raw[1:-1].strip()
     return raw
 
 
