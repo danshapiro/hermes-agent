@@ -120,6 +120,13 @@ const MAX_RECENT_IDS = 50;
 let sock = null;
 let connectionState = 'disconnected';
 
+function safeStartSocket(label) {
+    startSocket().catch(err => {
+        console.error(`[${label}] startSocket failed:`, err.message || err);
+        setTimeout(() => safeStartSocket(label), 30000);
+    });
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -141,7 +148,10 @@ async function startSocket() {
     },
   });
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  sock.ev.on('creds.update', () => {
+    saveCreds().catch(err => console.error('saveCreds failed:', err));
+    lidToPhone = buildLidMap();
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -166,7 +176,7 @@ async function startSocket() {
         } else {
           console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        setTimeout(() => safeStartSocket('reconnect'), reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -180,6 +190,7 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    try {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -364,6 +375,9 @@ async function startSocket() {
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
       }
+    }
+    } catch (err) {
+      console.error('messages.upsert handler error:', err);
     }
   });
 }
@@ -593,7 +607,10 @@ if (PAIR_ONLY) {
   console.log('📱 WhatsApp pairing mode');
   console.log(`📁 Session: ${SESSION_DIR}`);
   console.log();
-  startSocket();
+  startSocket().catch(err => {
+    console.error('Pairing failed:', err);
+    process.exit(1);
+  });
 } else {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
@@ -604,6 +621,6 @@ if (PAIR_ONLY) {
       console.log(`⚠️  No WHATSAPP_ALLOWED_USERS set — all messages will be processed`);
     }
     console.log();
-    startSocket();
+    safeStartSocket('startup');
   });
 }
