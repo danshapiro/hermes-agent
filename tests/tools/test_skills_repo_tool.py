@@ -261,15 +261,22 @@ class TestStageAndCommit:
         assert "error" in data
 
     def test_commit_rejects_staged_outside_skills(self, temp_git_repo):
-        # Stage a file outside skills/
+        # Create a file outside skills/ and stage it
+        (temp_git_repo / "README.md").write_text("# Readme")
         subprocess.run(
-            ["git", "add", "."],
+            ["git", "add", "README.md"],
             cwd=str(temp_git_repo), capture_output=True
         )
+        # Verify the file is actually staged
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=str(temp_git_repo), capture_output=True, text=True
+        )
+        assert "README.md" in staged.stdout, "README.md must be staged before test proceeds"
         with patch("tools.skills_repo_tool._resolve_repo_dir", return_value=temp_git_repo):
             result = skills_repo_handle(action="commit", message="bad commit")
         data = json.loads(result)
-        # Should detect the staged .gitkeep is outside skills/
+        # Should detect the staged README.md is outside skills/
         assert "error" in data
 
     def test_commit_with_files_param(self, temp_git_repo):
