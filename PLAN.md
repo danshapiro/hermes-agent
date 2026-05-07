@@ -2,7 +2,7 @@
 
 ## Root Cause
 
-The WhatsApp bridge process crashes due to **discarded promise rejections** from bare `startSocket()` calls, and Node.js v22 terminates the process on unhandled rejections by default.
+The WhatsApp bridge process crashes due to **discarded promise rejections** from bare async calls in `bridge.js`, and Node.js v22 terminates the process on unhandled rejections by default.
 
 ### Source Citations
 
@@ -21,6 +21,21 @@ startSocket();
 startSocket();
 ```
 The initial startup calls also discard the returned promise. If `startSocket()` fails on first launch, the bridge exits silently with no error log, making the failure invisible to the Python adapter.
+
+**Additional unhandled rejection paths in `startSocket()`:**
+
+1. **`saveCreds()` at line 144** — the async function from `useMultiFileAuthState()` is called without `.catch()` in the `creds.update` event handler:
+   ```js
+   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+   ```
+   If the filesystem fails (disk full, permissions), `saveCreds()` rejects unhandled.
+
+2. **`messages.upsert` handler at line 182** — the `async` handler contains `await downloadMediaMessage(...)` calls (lines 263, 279, 294, 310) for image/video/audio/document processing. If Baileys' event emitter does not catch async handler rejections, any unhandled exception in this handler terminates the process:
+   ```js
+   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+       // ... await downloadMediaMessage(...) inside
+   });
+   ```
 
 **Verified behavior — Node.js v22.22.0 on the live host:**
 ```
@@ -66,31 +81,59 @@ The `ssl:default` string simply means aiohttp used its default SSL context (none
 
 ## Fix
 
-### Primary: `scripts/whatsapp-bridge/bridge.js`
+### A. `scripts/whatsapp-bridge/bridge.js` — unhandled rejection guards
 
-Three call sites need attention:
+**1. Add `safeStartSocket` helper** (after line 122, before `startSocket`):
 
-**1. Reconnection (line 169)** — needs retry on failure:
+```js
+function safeStartSocket(label) {
+    startSocket().catch(err => {
+        console.error(`[${label}] startSocket failed:`, err.message || err);
+        setTimeout(() => safeStartSocket(label), 30000);
+    });
+}
+```
+
+**2. Guard `saveCreds()` in `creds.update` (line 144):**
+
+```js
+// Before:
+sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+
+// After:
+sock.ev.on('creds.update', () => {
+    saveCreds().catch(err => console.error('saveCreds failed:', err));
+    lidToPhone = buildLidMap();
+});
+```
+
+**3. Guard `messages.upsert` handler (line 182):**
+
+Wrap the entire handler body in try/catch so any unhandled rejection inside media downloads or message processing is caught and logged instead of terminating the process:
+
+```js
+sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    try {
+        // ... existing handler body (lines 183-367) ...
+    } catch (err) {
+        console.error('messages.upsert handler error:', err);
+    }
+});
+```
+
+**4. Reconnection (line 169):**
 
 ```js
 // Before:
 setTimeout(startSocket, reason === 515 ? 1000 : 3000);
 
 // After:
-function safeStartSocket(label) {
-    startSocket().catch(err => {
-        console.error(`[${label}] startSocket failed:`, err.message || err);
-        // Retry after 30s — same semantics as the original code, but without crashing
-        setTimeout(() => safeStartSocket(label), 30000);
-    });
-}
-// ...
 setTimeout(() => safeStartSocket('reconnect'), reason === 515 ? 1000 : 3000);
 ```
 
-Note: The `connection.update` handler is re-registered inside each `startSocket()` call. When `startSocket()` rejects before `makeWASocket()` completes, `sock` was never set and no stale handlers remain. A retry from `safeStartSocket` calls `startSocket()` fresh, which re-registers everything. A lambda wrapper is needed (not `setTimeout(safeStartSocket, ...)`) because `safeStartSocket` takes a label argument.
+The initial delay respects the original 1s/3s cadence. On failure, `safeStartSocket` retries every 30s — new behavior for failure recovery (previously the process would crash). A lambda wrapper is required because `safeStartSocket` takes a label argument.
 
-**2. Normal startup (line 607)** — same retry pattern:
+**5. Normal startup (line 607):**
 
 ```js
 // Before:
@@ -100,9 +143,9 @@ startSocket();
 safeStartSocket('startup');
 ```
 
-Here the HTTP server is already listening (`app.listen` callback), so a retry on failure is correct — the bridge stays responsive via HTTP and can recover the WhatsApp connection.
+**Behavioral change note:** With this fix, when the bridge starts but WhatsApp cannot authenticate, the HTTP server stays alive and the Python adapter proceeds through the warn-and-proceed path (`connect()` returns True with a warning) instead of failing hard. This is an improvement — the bridge retries in the background while the adapter remains operational. The adapter already handles this case (lines 499-536 of `whatsapp.py`).
 
-**3. Pair-only mode (line 596)** — log and exit:
+**6. Pair-only mode (line 596):**
 
 ```js
 // Before:
@@ -115,21 +158,27 @@ startSocket().catch(err => {
 });
 ```
 
-Pair-only mode is supposed to connect, save creds, and exit. If connection fails, exit with a clear error message (written to stderr → bridge.log) rather than an opaque unhandled rejection crash.
+Pair-only mode is supposed to connect, save creds, and exit. On connection failure, exit with a clear error message (written to stderr, which `hermes whatsapp` shows to the user via `subprocess.run` in `hermes_cli/main.py:1545`). No retry — user needs to retry manually.
 
-### Placement
-
-Define `safeStartSocket` before the `connection.update` handler at line 146 (before its first use at line 169), e.g., after the `let sock = null` declaration at line 120.
-
-### No Python-side changes needed
+### B. No Python-side changes required
 
 The Python adapter (`gateway/platforms/whatsapp.py`) correctly handles bridge exit detection via `_check_managed_bridge_exit()`. Once the bridge no longer crashes on reconnection failure, the adapter's polling loop will continue running and the bridge will retry reconnection on its own.
 
+The existing Python test `test_send_marks_retryable_fatal_when_managed_bridge_exits` in `tests/gateway/test_whatsapp_connect.py` remains valid — the adapter still correctly handles bridge process death. The fix adds resilience so the bridge dies less often, but the fatal-error path is still reachable and correctly tested.
+
 ## Verification
 
-1. **Static**: Confirm all three `startSocket()` call sites are guarded against unhandled rejections
-2. **Node.js unit test**: Add a test in `scripts/whatsapp-bridge/allowlist.test.mjs` (or a new `bridge.test.mjs`) that verifies `startSocket` rejection handling:
-   - Mock `startSocket` to reject, verify `safeStartSocket` logs the error and schedules a retry
-   - Test that unhandled rejections do NOT escape to the Node.js runtime (process does not exit)
-3. **Python integration test**: Add a test in `tests/gateway/test_whatsapp_connect.py` that verifies the adapter survives a bridge process exit with code 1 (current behavior already tested in `test_send_marks_retryable_fatal_when_managed_bridge_exits` — the fix changes nothing on the Python side, the test remains valid as-is)
-4. **Smoke test**: Start Hermes with WhatsApp enabled, trigger a WhatsApp disconnection, confirm bridge reconnects without crashing (bridge.log shows `[reconnect] startSocket failed: ...` instead of silent process death)
+1. **Static**: Confirm all five unhandled-rejection paths are guarded:
+   - `startSocket()` in reconnection (line 169) → `safeStartSocket`
+   - `startSocket()` in pair-only (line 596) → `.catch()`
+   - `startSocket()` in startup (line 607) → `safeStartSocket`
+   - `saveCreds()` in creds.update (line 144) → `.catch()`
+   - `messages.upsert` handler (line 182) → try/catch
+
+2. **Node.js unit test**: Add a test in a new `scripts/whatsapp-bridge/bridge.test.mjs` that verifies `safeStartSocket` handles rejections:
+   - Mock `startSocket` to reject, verify `safeStartSocket` logs the error and schedules a retry (times out after 30s, but test doesn't wait for the timeout)
+   - Verify no unhandled rejection escapes to the runtime
+
+3. **Python integration test**: Add a test verifying the adapter survives when the bridge is alive but not yet connected (warn-and-proceed path at `whatsapp.py:522-526`).
+
+4. **Smoke test**: Start Hermes with WhatsApp enabled, trigger a WhatsApp disconnection, confirm bridge reconnects without crashing (bridge.log shows `[reconnect] startSocket failed: ...` instead of silent process death).
