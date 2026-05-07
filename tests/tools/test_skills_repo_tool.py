@@ -98,6 +98,11 @@ class TestValidateFrontmatter:
         content = "---\nversion: 1.0\n\ndescription: |\n  A multi-line description.\nname: my-skill\n---\n# Content"
         assert _validate_frontmatter(content) is None
 
+    def test_body_content_with_name_and_dashes_not_mistaken_for_frontmatter(self):
+        # Body contains 'name:' and '---', which should NOT satisfy frontmatter validation.
+        content = "---\ndescription: no name field\n---\n# Body\n\n## Section\n\nname: trick\n---\n"
+        assert _validate_frontmatter(content) is not None
+
 
 class TestValidateContentSize:
     def test_small_content_passes(self):
@@ -294,10 +299,10 @@ class TestLog:
 
 class TestPushNoAuth:
     def test_push_returns_clear_error_without_auth(self, temp_git_repo):
-        # Set origin to an invalid URL instead of removing it.
-        # This exercises the real "Could not read from remote repository" path.
+        # Set up an origin remote so the push path is exercised.
+        # Point it at an unreachable host so we hit the credential/permission error.
         subprocess.run(
-            ["git", "remote", "set-url", "origin", "https://invalid.example/repo"],
+            ["git", "remote", "add", "origin", "https://nonexistent-host-hermes-test.example/repo"],
             cwd=str(temp_git_repo), capture_output=True
         )
         with patch("tools.skills_repo_tool._resolve_repo_dir", return_value=temp_git_repo):
