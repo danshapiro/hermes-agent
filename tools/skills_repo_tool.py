@@ -34,7 +34,7 @@ _GIT_TIMEOUT = 30
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
 _CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # category: subdirectories only, no path separators
 _FRONTMATTER_NAME_RE = re.compile(r"^name\s*:\s*(.+)$", re.MULTILINE)
-_FM_NAME_CLEAN_RE = re.compile(r'\s*#.*$')  # strip YAML trailing comments
+_FM_NAME_CLEAN_RE = re.compile(r'(?:(?<=^)|(?<=\s))#.*$')  # strip YAML trailing comments only outside quotes
 _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 
 
