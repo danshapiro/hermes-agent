@@ -150,20 +150,31 @@ def _validate_frontmatter(content: str) -> Optional[str]:
     """Check that content has basic YAML frontmatter with a 'name' field.
 
     Only inspects the first frontmatter block (between the opening --- and
-    the closing ---).  Body content after the closing delimiter is ignored
-    to prevent false positives from markdown sections containing 'name:'.
+    the closing --- on its own line).  Body content after the closing
+    delimiter is ignored to prevent false positives.
     """
-    parts = content.strip().split("---", 2)
-    if len(parts) < 3 or not parts[1].strip():
+    stripped = content.strip()
+    if not stripped.startswith("---"):
         return (
             "content must start with YAML frontmatter (---\\n...\\n---) "
             "containing at least a 'name:' field"
         )
-    if not _FRONTMATTER_NAME_RE.search(parts[1]):
-        return (
-            "frontmatter must contain a 'name:' field"
-        )
-    return None
+    # Find the closing --- on its own line (allows leading whitespace only)
+    # Search starting after the opening ---
+    body = stripped[3:]
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            fm_content = "\n".join(lines[:i])
+            if not fm_content.strip():
+                return "frontmatter block is empty"
+            if not _FRONTMATTER_NAME_RE.search(fm_content):
+                return "frontmatter must contain a 'name:' field"
+            return None
+    return (
+        "content must start with YAML frontmatter (---\\n...\\n---) "
+        "containing at least a 'name:' field"
+    )
 
 
 def _validate_content_size(content: str) -> Optional[str]:
@@ -203,12 +214,25 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     return None
 
 
+def _split_frontmatter(content: str) -> Optional[str]:
+    """Return the frontmatter body (between opening/closing --- lines) or None."""
+    stripped = content.strip()
+    if not stripped.startswith("---"):
+        return None
+    body = stripped[3:]
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            return "\n".join(lines[:i]).strip()
+    return None
+
+
 def _extract_frontmatter_name_from_content(content: str) -> Optional[str]:
     """Extract the 'name:' field from the first frontmatter block in raw SKILL.md content."""
-    parts = content.strip().split("---", 2)
-    if len(parts) < 3:
+    fm = _split_frontmatter(content)
+    if fm is None:
         return None
-    m = _FRONTMATTER_NAME_RE.search(parts[1])
+    m = _FRONTMATTER_NAME_RE.search(fm)
     if m:
         return m.group(1).strip()
     return None
@@ -223,10 +247,10 @@ def _extract_frontmatter_name(skill_dir: Path) -> Optional[str]:
         content = skill_md.read_text(encoding="utf-8")
     except Exception:
         return None
-    parts = content.strip().split("---", 2)
-    if len(parts) < 3:
+    fm = _split_frontmatter(content)
+    if fm is None:
         return None
-    m = _FRONTMATTER_NAME_RE.search(parts[1])
+    m = _FRONTMATTER_NAME_RE.search(fm)
     if m:
         return m.group(1).strip()
     return None
@@ -430,7 +454,9 @@ def _current_branch(repo_dir: Path) -> Optional[str]:
 
 
 def _handle_push(repo_dir: Path) -> str:
-    branch = _current_branch(repo_dir) or "main"
+    branch = _current_branch(repo_dir)
+    if not branch:
+        return json.dumps({"error": "cannot push: not on a branch (detached HEAD)"})
     ok, stdout, stderr = _run_git(
         ["push", "origin", branch], repo_dir, timeout=60
     )
@@ -444,7 +470,9 @@ def _handle_push(repo_dir: Path) -> str:
 
 
 def _handle_pull(repo_dir: Path) -> str:
-    branch = _current_branch(repo_dir) or "main"
+    branch = _current_branch(repo_dir)
+    if not branch:
+        return json.dumps({"error": "cannot pull: not on a branch (detached HEAD)"})
     ok, stdout, stderr = _run_git(
         ["pull", "--ff-only", "origin", branch], repo_dir, timeout=60
     )
@@ -587,55 +615,52 @@ def skills_repo_handle(
 # --- Schema ---
 
 SKILLS_REPO_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "skills_repo",
-        "description": (
-            "Manage the portable skills git repository. "
-            "Actions: status, diff, diff_staged, stage, commit, push, pull, log, create. "
-            "All operations run in the portable-skills repo at skills.repo_dir. "
-            "Stage and commit operate only on files under skills/. "
-            "Pull fast-forwards remote changes; push publishes local commits. "
-            "Create writes a new SKILL.md with validated YAML frontmatter under "
-            "skills/<name>/ (or skills/<category>/<name>/ when category is set) "
-            "and stages it."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["status", "diff", "diff_staged", "stage", "commit", "push", "pull", "log", "create"],
-                    "description": "The git operation to perform."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Skill name (required for 'create'). Lowercase letters, digits, and hyphens."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full SKILL.md content for 'create' (YAML frontmatter + markdown body)."
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Optional category subdirectory for organizing the skill (e.g. 'devops', 'data-science'). Only used with 'create'."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Commit message (required for 'commit')."
-                },
-                "files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "File paths relative to repo root (must be under skills/). For 'stage': files to stage. For 'commit': optional files to add before committing."
-                },
-                "count": {
-                    "type": "integer",
-                    "description": "Number of commits for 'log' (default: 10, max: 100)."
-                },
+    "name": "skills_repo",
+    "description": (
+        "Manage the portable skills git repository. "
+        "Actions: status, diff, diff_staged, stage, commit, push, pull, log, create. "
+        "All operations run in the portable-skills repo at skills.repo_dir. "
+        "Stage and commit operate only on files under skills/. "
+        "Pull fast-forwards remote changes; push publishes local commits. "
+        "Create writes a new SKILL.md with validated YAML frontmatter under "
+        "skills/<name>/ (or skills/<category>/<name>/ when category is set) "
+        "and stages it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["status", "diff", "diff_staged", "stage", "commit", "push", "pull", "log", "create"],
+                "description": "The git operation to perform."
             },
-            "required": ["action"],
+            "name": {
+                "type": "string",
+                "description": "Skill name (required for 'create'). Lowercase letters, digits, and hyphens."
+            },
+            "content": {
+                "type": "string",
+                "description": "Full SKILL.md content for 'create' (YAML frontmatter + markdown body)."
+            },
+            "category": {
+                "type": "string",
+                "description": "Optional category subdirectory for organizing the skill (e.g. 'devops', 'data-science'). Only used with 'create'."
+            },
+            "message": {
+                "type": "string",
+                "description": "Commit message (required for 'commit')."
+            },
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "File paths relative to repo root (must be under skills/). For 'stage': files to stage. For 'commit': optional files to add before committing."
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of commits for 'log' (default: 10, max: 100)."
+            },
         },
+        "required": ["action"],
     },
 }
 
