@@ -37,14 +37,6 @@ _CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # category: subdirectories o
 _FRONTMATTER_NAME_RE = re.compile(r"^name\s*:\s*(.+)$", re.MULTILINE)
 _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 
-# Minimal YAML frontmatter check: must start with '---' and have at least
-# a 'name:' field. Full validation is deferred to the skill loader, but
-# this catches obvious malformed content early.
-_FRONTMATTER_MIN_RE = re.compile(
-    r"\A---\s*\n.*?\bname\s*:.+\n.*?---\s*\n",
-    re.DOTALL,
-)
-
 
 def _find_repo_dir() -> Optional[Path]:
     """Resolve the skills repo directory from config or external_dirs scan."""
@@ -53,7 +45,13 @@ def _find_repo_dir() -> Optional[Path]:
         cfg = load_config()
         repo_dir = cfg_get(cfg, "skills", "repo_dir")
         if repo_dir:
-            path = Path(str(repo_dir)).expanduser().resolve()
+            raw = str(repo_dir)
+            expanded = os.path.expanduser(os.path.expandvars(raw))
+            path = Path(expanded)
+            if not path.is_absolute():
+                from hermes_constants import get_hermes_home
+                path = (get_hermes_home() / path)
+            path = path.resolve()
             if (path / ".git").exists():
                 return path
     except Exception:
@@ -64,7 +62,13 @@ def _find_repo_dir() -> Optional[Path]:
         cfg = load_config()
         external_dirs = cfg_get(cfg, "skills", "external_dirs") or []
         for d in external_dirs:
-            p = Path(str(d)).expanduser().resolve()
+            raw = str(d)
+            expanded = os.path.expanduser(os.path.expandvars(raw))
+            p = Path(expanded)
+            if not p.is_absolute():
+                from hermes_constants import get_hermes_home
+                p = (get_hermes_home() / p)
+            p = p.resolve()
             git_dir = p
             while git_dir != git_dir.parent:
                 if (git_dir / ".git").exists():
@@ -143,11 +147,21 @@ def _validate_path(repo_dir: Path, rel_path: str) -> Optional[str]:
 
 
 def _validate_frontmatter(content: str) -> Optional[str]:
-    """Check that content has basic YAML frontmatter with a 'name' field."""
-    if not _FRONTMATTER_MIN_RE.match(content.strip()):
+    """Check that content has basic YAML frontmatter with a 'name' field.
+
+    Only inspects the first frontmatter block (between the opening --- and
+    the closing ---).  Body content after the closing delimiter is ignored
+    to prevent false positives from markdown sections containing 'name:'.
+    """
+    parts = content.strip().split("---", 2)
+    if len(parts) < 3 or not parts[1].strip():
         return (
             "content must start with YAML frontmatter (---\\n...\\n---) "
             "containing at least a 'name:' field"
+        )
+    if not _FRONTMATTER_NAME_RE.search(parts[1]):
+        return (
+            "frontmatter must contain a 'name:' field"
         )
     return None
 
@@ -190,8 +204,11 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
 
 
 def _extract_frontmatter_name_from_content(content: str) -> Optional[str]:
-    """Extract the 'name:' field from raw SKILL.md content frontmatter."""
-    m = _FRONTMATTER_NAME_RE.search(content)
+    """Extract the 'name:' field from the first frontmatter block in raw SKILL.md content."""
+    parts = content.strip().split("---", 2)
+    if len(parts) < 3:
+        return None
+    m = _FRONTMATTER_NAME_RE.search(parts[1])
     if m:
         return m.group(1).strip()
     return None
@@ -206,7 +223,10 @@ def _extract_frontmatter_name(skill_dir: Path) -> Optional[str]:
         content = skill_md.read_text(encoding="utf-8")
     except Exception:
         return None
-    m = _FRONTMATTER_NAME_RE.search(content)
+    parts = content.strip().split("---", 2)
+    if len(parts) < 3:
+        return None
+    m = _FRONTMATTER_NAME_RE.search(parts[1])
     if m:
         return m.group(1).strip()
     return None
@@ -401,9 +421,18 @@ def _handle_commit(repo_dir: Path, message: str,
     return json.dumps({"commit": stdout})
 
 
+def _current_branch(repo_dir: Path) -> Optional[str]:
+    """Return the current branch name for the repo, or None."""
+    ok, stdout, _ = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], repo_dir)
+    if ok and stdout and stdout != "HEAD":
+        return stdout
+    return None
+
+
 def _handle_push(repo_dir: Path) -> str:
+    branch = _current_branch(repo_dir) or "main"
     ok, stdout, stderr = _run_git(
-        ["push", "origin", "main"], repo_dir, timeout=60
+        ["push", "origin", branch], repo_dir, timeout=60
     )
     if not ok:
         if "Permission denied" in stderr or "Could not read from remote repository" in stderr:
@@ -415,8 +444,9 @@ def _handle_push(repo_dir: Path) -> str:
 
 
 def _handle_pull(repo_dir: Path) -> str:
+    branch = _current_branch(repo_dir) or "main"
     ok, stdout, stderr = _run_git(
-        ["pull", "--ff-only", "origin", "main"], repo_dir, timeout=60
+        ["pull", "--ff-only", "origin", branch], repo_dir, timeout=60
     )
     if not ok:
         return json.dumps({"error": stderr or "git pull failed"})
