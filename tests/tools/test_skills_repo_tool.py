@@ -103,6 +103,10 @@ class TestValidateFrontmatter:
         content = "---\ndescription: no name field\n---\n# Body\n\n## Section\n\nname: trick\n---\n"
         assert _validate_frontmatter(content) is not None
 
+    def test_leading_whitespace_before_opening_dash_rejected(self):
+        content = "\n\n---\nname: test\n---\n"
+        assert _validate_frontmatter(content) is not None
+
 
 class TestValidateContentSize:
     def test_small_content_passes(self):
