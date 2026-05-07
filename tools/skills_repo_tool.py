@@ -1,8 +1,7 @@
 """Skills Repo Tool -- Agent-Managed Git Operations on the Portable Skills Repo.
 
 Allows the agent to view, stage, commit, push, pull, and create skills in the
-shared portable-skills git repository at ``skills.repo_dir`` (config.yaml) or
-found by scanning ``skills.external_dirs`` for a ``.git/`` parent.
+shared portable-skills git repository at ``skills.repo_dir`` (config.yaml).
 
 Actions:
   status       -- Show modified/new/deleted files (git status --porcelain)
@@ -35,6 +34,7 @@ _GIT_TIMEOUT = 30
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
 _CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # category: subdirectories only, no path separators
 _FRONTMATTER_NAME_RE = re.compile(r"^name\s*:\s*(.+)$", re.MULTILINE)
+_FM_NAME_CLEAN_RE = re.compile(r'\s*#.*$')  # strip YAML trailing comments
 _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 
 
@@ -99,8 +99,7 @@ def _resolve_repo_dir() -> Path:
     d = _find_repo_dir()
     if d is None:
         raise RuntimeError(
-            "skills_repo: no git repo found. Set skills.repo_dir in config.yaml "
-            "or ensure a skills.external_dirs entry has a .git/ parent."
+            "skills_repo: no git repo found. Set skills.repo_dir in config.yaml."
         )
     return d
 
@@ -203,6 +202,15 @@ def _split_frontmatter(content: str) -> Optional[str]:
     return content[3:end_match.start() + 3].strip()
 
 
+def _normalize_frontmatter_name(raw_name: str) -> str:
+    """Normalize a frontmatter name value, stripping YAML quotes and comments."""
+    raw = raw_name.strip()
+    if len(raw) >= 2 and ((raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'"))):
+        raw = raw[1:-1]
+    raw = _FM_NAME_CLEAN_RE.sub('', raw).strip()
+    return raw
+
+
 def _extract_frontmatter_name_from_content(content: str) -> Optional[str]:
     """Extract the 'name:' field from the first frontmatter block in raw SKILL.md content."""
     fm = _split_frontmatter(content)
@@ -210,7 +218,7 @@ def _extract_frontmatter_name_from_content(content: str) -> Optional[str]:
         return None
     m = _FRONTMATTER_NAME_RE.search(fm)
     if m:
-        return m.group(1).strip()
+        return _normalize_frontmatter_name(m.group(1))
     return None
 
 
@@ -228,7 +236,7 @@ def _extract_frontmatter_name(skill_dir: Path) -> Optional[str]:
         return None
     m = _FRONTMATTER_NAME_RE.search(fm)
     if m:
-        return m.group(1).strip()
+        return _normalize_frontmatter_name(m.group(1))
     return None
 
 
@@ -282,14 +290,12 @@ def _check_name_unique_in_repo(repo_dir: Path, name: str,
         if skill_path.is_dir():
             return f"skill {name!r} already exists in the repo at skills/{name}/"
 
-    # Directory basename collision across all category levels.
-    # Hermes resolves skills by directory basename for nested paths (e.g.
-    # skills/mlops/training/trl-fine-tuning/ maps to basename 'trl-fine-tuning').
+    # Directory basename collision — only for directories that contain SKILL.md.
+    # Category/support folders without SKILL.md are not skills.
     skills_root = repo_dir / "skills"
     if skills_root.is_dir():
-        for d in skills_root.rglob("*"):
-            if not d.is_dir():
-                continue
+        for skill_md in skills_root.rglob("SKILL.md"):
+            d = skill_md.parent
             if d.name != name:
                 continue
             # Skip the exact target path (already rejected by path check above)
