@@ -83,16 +83,42 @@ The `ssl:default` string simply means aiohttp used its default SSL context (none
 
 ### A. `scripts/whatsapp-bridge/bridge.js` — unhandled rejection guards
 
-**1. Add `safeStartSocket` helper** (after line 122, before `startSocket`):
+**1. Add `safe-start.mjs` (new shared module):**
+
+Extracts the retry-and-rejection-catch logic into a dependency-injectable factory, independently testable without importing Baileys:
 
 ```js
-function safeStartSocket(label) {
-    startSocket().catch(err => {
-        console.error(`[${label}] startSocket failed:`, err.message || err);
-        setTimeout(() => safeStartSocket(label), 30000);
-    });
+export function createSafeStart(startFn, { setTimeout, clearTimeout, consoleError } = {}) {
+    let inProgress = false;
+    let retryTimer = null;
+
+    return function safeStart(label) {
+        if (inProgress) return;
+        if (retryTimer) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+        }
+        inProgress = true;
+        startFn()
+            .then(() => { inProgress = false; })
+            .catch(err => {
+                consoleError(`[${label}] start failed:`, err.message || err);
+                inProgress = false;
+                retryTimer = setTimeout(() => safeStart(label), 30000);
+            });
+    };
 }
 ```
+
+In `bridge.js`, `safeStartSocket` is created as:
+```js
+import { createSafeStart } from './safe-start.mjs';
+const safeStartSocket = createSafeStart(startSocket);
+```
+
+This replaces an inline function with the same semantics, plus two guards not in the original:
+- **`inProgress` flag**: blocks concurrent `startSocket()` calls when a reconnect fires while a previous attempt is still running
+- **`retryTimer` cancellation**: when a fresh reconnect (e.g. from `connection.update` 'close') fires, any pending retry from a prior failure is cancelled — the fresh signal takes precedence
 
 **2. Guard `saveCreds()` in `creds.update` (line 144):**
 
@@ -175,10 +201,18 @@ The existing Python test `test_send_marks_retryable_fatal_when_managed_bridge_ex
    - `saveCreds()` in creds.update (line 144) → `.catch()`
    - `messages.upsert` handler (line 182) → try/catch
 
-2. **Node.js unit test**: Add a test in a new `scripts/whatsapp-bridge/bridge.test.mjs` that verifies `safeStartSocket` handles rejections:
-   - Mock `startSocket` to reject, verify `safeStartSocket` logs the error and schedules a retry (times out after 30s, but test doesn't wait for the timeout)
-   - Verify no unhandled rejection escapes to the runtime
+2. **Node.js unit tests** (`scripts/whatsapp-bridge/bridge.test.mjs` — 6 tests, all passing):
+   - Rejection catch and retry scheduling (mock setTimeout)
+   - Retry on subsequent failures (timer fire simulation)
+   - No unhandled rejection leak (process event listener)
+   - Success path — no retry scheduled on success
+   - Concurrent call prevention — `inProgress` flag blocks duplicate calls
+   - Pending retry cancellation — fresh reconnect clears stale retry timer
+   - Tests import `createSafeStart` from `safe-start.mjs` — the exact same module bridge.js uses, with no Baileys dependency
+   - Run with: `node --test bridge.test.mjs allowlist.test.mjs` (or `npm test` in the bridge directory)
 
-3. **Python integration test**: Add a test verifying the adapter survives when the bridge is alive but not yet connected (warn-and-proceed path at `whatsapp.py:522-526`).
+3. **CI wiring** (`.github/workflows/tests.yml`):
+   - Added `Run Node tests (WhatsApp bridge)` step after Python tests
+   - `package.json` `scripts.test` entry added
 
-4. **Smoke test**: Start Hermes with WhatsApp enabled, trigger a WhatsApp disconnection, confirm bridge reconnects without crashing (bridge.log shows `[reconnect] startSocket failed: ...` instead of silent process death).
+4. **Smoke test**: Start Hermes with WhatsApp enabled, trigger a WhatsApp disconnection, confirm bridge reconnects without crashing (bridge.log shows `[reconnect] start failed: ...` instead of silent process death).

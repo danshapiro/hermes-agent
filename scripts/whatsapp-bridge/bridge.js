@@ -29,6 +29,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { createSafeStart } from './safe-start.mjs';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -159,23 +160,7 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
-let _safeStartInProgress = false;
-
-function safeStartSocket(label) {
-    if (_safeStartInProgress) {
-        return;
-    }
-    _safeStartInProgress = true;
-    startSocket()
-        .then(() => {
-            _safeStartInProgress = false;
-        })
-        .catch(err => {
-            console.error(`[${label}] startSocket failed:`, err.message || err);
-            _safeStartInProgress = false;
-            setTimeout(() => safeStartSocket(label), 30000);
-        });
-}
+const safeStartSocket = createSafeStart(startSocket);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);

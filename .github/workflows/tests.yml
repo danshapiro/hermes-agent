@@ -43,7 +43,7 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run tests
+      - name: Run Python tests
         run: |
           source .venv/bin/activate
           python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
@@ -52,6 +52,11 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Run Node tests (WhatsApp bridge)
+        run: |
+          cd scripts/whatsapp-bridge
+          node --test bridge.test.mjs allowlist.test.mjs
 
   e2e:
     runs-on: ubuntu-latest
