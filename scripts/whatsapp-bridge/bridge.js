@@ -159,12 +159,22 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let _safeStartInProgress = false;
 
 function safeStartSocket(label) {
-    startSocket().catch(err => {
-        console.error(`[${label}] startSocket failed:`, err.message || err);
-        setTimeout(() => safeStartSocket(label), 30000);
-    });
+    if (_safeStartInProgress) {
+        return;
+    }
+    _safeStartInProgress = true;
+    startSocket()
+        .then(() => {
+            _safeStartInProgress = false;
+        })
+        .catch(err => {
+            console.error(`[${label}] startSocket failed:`, err.message || err);
+            _safeStartInProgress = false;
+            setTimeout(() => safeStartSocket(label), 30000);
+        });
 }
 
 async function startSocket() {

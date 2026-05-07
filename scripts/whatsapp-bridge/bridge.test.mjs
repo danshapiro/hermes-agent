@@ -97,6 +97,9 @@ test('safeStart does not crash process on rejection', async () => {
     const handler = (reason) => { rejectionEvents.push(reason); };
     process.on('unhandledRejection', handler);
 
+    const origSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = () => {}; // suppress retry timer
+
     const failingStart = async () => {
         throw new Error('should be caught');
     };
@@ -105,11 +108,12 @@ test('safeStart does not crash process on rejection', async () => {
         safeStart('no-crash', failingStart);
 
         // Wait for the catch handler microtask to run
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => origSetTimeout(r, 10));
 
         assert.equal(rejectionEvents.length, 0, 'no unhandled rejection');
     } finally {
         process.off('unhandledRejection', handler);
+        globalThis.setTimeout = origSetTimeout;
     }
 });
 
