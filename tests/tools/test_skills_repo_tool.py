@@ -17,10 +17,12 @@ from tools.skills_repo_tool import (
     _validate_path,
     _validate_frontmatter,
     _validate_content_size,
+    _validate_category,
     _run_git,
     _handle_status,
     _handle_create,
     _check_name_unique_in_repo,
+    _extract_frontmatter_name,
     _handle_commit,
     skills_repo_handle,
     _MAX_CONTENT_SIZE,
@@ -98,6 +100,29 @@ class TestValidateContentSize:
         assert _validate_content_size(big) is not None
 
 
+class TestValidateCategory:
+    def test_valid_category(self):
+        assert _validate_category("devops") is None
+        assert _validate_category("data-science") is None
+        assert _validate_category("") is None
+        assert _validate_category("test123") is None
+
+    def test_invalid_category_path_traversal(self):
+        assert _validate_category("../outside") is not None
+        assert _validate_category("foo/bar") is not None
+        assert _validate_category(".") is not None
+        assert _validate_category("..") is not None
+        assert _validate_category("/etc") is not None
+
+    def test_invalid_category_characters(self):
+        assert _validate_category("My Category") is not None
+        assert _validate_category("dev ops") is not None
+        assert _validate_category("dev_ops") is not None
+
+    def test_category_too_long(self):
+        assert _validate_category("a" * 65) is not None
+
+
 class TestStatus:
     def test_clean_repo(self, temp_git_repo):
         result = _handle_status(temp_git_repo)
@@ -157,6 +182,26 @@ class TestCreate:
         data = json.loads(result)
         assert "error" in data
         assert "already exists" in data["error"]
+
+    def test_rejects_path_traversal_in_category(self, temp_git_repo):
+        content = "---\nname: escape\n---\n# Escape"
+        result = _handle_create(temp_git_repo, "escape", content, category="../outside")
+        data = json.loads(result)
+        assert "error" in data
+        assert "category" in data["error"].lower()
+        # Verify no directory was created outside skills/
+        assert not (temp_git_repo / "outside").exists()
+
+    def test_rejects_frontmatter_name_collision(self, temp_git_repo):
+        # Create a skill in category "devops" with frontmatter name "shared-name"
+        content1 = "---\nname: shared-name\n---\n# DevOps version"
+        _handle_create(temp_git_repo, "dev-skill", content1, category="devops")
+        # Try to create another skill in different directory with same frontmatter name
+        content2 = "---\nname: shared-name\n---\n# Flat version"
+        result = _handle_create(temp_git_repo, "other-skill", content2)
+        data = json.loads(result)
+        assert "error" in data
+        assert "already used" in data["error"].lower() or "collision" in data["error"].lower()
 
 
 class TestStageAndCommit:
