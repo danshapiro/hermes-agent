@@ -85,10 +85,10 @@ def _run_git(args: List[str], repo_dir: Path,
     """Run a git command. Returns (ok, stdout, stderr)."""
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    # Clear env vars that could override per-repo git config
+    # Clear env vars that could override per-repo git config.
+    # Do NOT clear GIT_SSH_COMMAND — it is the canonical credential path.
     env.pop("GIT_DIR", None)
     env.pop("GIT_WORK_TREE", None)
-    env.pop("GIT_SSH_COMMAND", None)
     try:
         result = subprocess.run(
             ["git"] + list(args),
@@ -150,31 +150,22 @@ def _validate_frontmatter(content: str) -> Optional[str]:
     """Check that content has basic YAML frontmatter with a 'name' field.
 
     Only inspects the first frontmatter block (between the opening --- and
-    the closing --- on its own line).  Body content after the closing
-    delimiter is ignored to prevent false positives.
+    the closing ---). Body content after the closing delimiter is ignored.
+    Uses the same start/end rules as agent/skill_utils.py parse_frontmatter.
     """
-    stripped = content.strip()
-    if not stripped.startswith("---"):
+    if not content.startswith("---"):
         return (
-            "content must start with YAML frontmatter (---\\n...\\n---) "
-            "containing at least a 'name:' field"
+            "content must start with YAML frontmatter (---) exactly at the "
+            "beginning of the file containing at least a 'name:' field"
         )
-    # Find the closing --- on its own line (allows leading whitespace only)
-    # Search starting after the opening ---
-    body = stripped[3:]
-    lines = body.split("\n")
-    for i, line in enumerate(lines):
-        if line.strip() == "---":
-            fm_content = "\n".join(lines[:i])
-            if not fm_content.strip():
-                return "frontmatter block is empty"
-            if not _FRONTMATTER_NAME_RE.search(fm_content):
-                return "frontmatter must contain a 'name:' field"
-            return None
-    return (
-        "content must start with YAML frontmatter (---\\n...\\n---) "
-        "containing at least a 'name:' field"
-    )
+    fm = _split_frontmatter(content)
+    if fm is None:
+        return "frontmatter block is missing or has no closing --- on its own line"
+    if not fm.strip():
+        return "frontmatter block is empty"
+    if not _FRONTMATTER_NAME_RE.search(fm):
+        return "frontmatter must contain a 'name:' field"
+    return None
 
 
 def _validate_content_size(content: str) -> Optional[str]:
@@ -215,16 +206,17 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
 
 
 def _split_frontmatter(content: str) -> Optional[str]:
-    """Return the frontmatter body (between opening/closing --- lines) or None."""
-    stripped = content.strip()
-    if not stripped.startswith("---"):
+    """Return the frontmatter body (between opening/closing ---) or None.
+
+    Matches the canonical parser in agent/skill_utils.py parse_frontmatter.
+    Requires --- as the very first characters and --- on its own line to close.
+    """
+    if not content.startswith("---"):
         return None
-    body = stripped[3:]
-    lines = body.split("\n")
-    for i, line in enumerate(lines):
-        if line.strip() == "---":
-            return "\n".join(lines[:i]).strip()
-    return None
+    end_match = re.search(r"\n---\s*\n", content[3:])
+    if not end_match:
+        return None
+    return content[3:end_match.start() + 3].strip()
 
 
 def _extract_frontmatter_name_from_content(content: str) -> Optional[str]:
