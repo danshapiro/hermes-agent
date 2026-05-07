@@ -90,6 +90,14 @@ class TestValidateFrontmatter:
         content = "# Just markdown, no frontmatter"
         assert _validate_frontmatter(content) is not None
 
+    def test_name_not_first_field_passes(self):
+        content = "---\ndescription: A test\nname: my-skill\n---\n# Content"
+        assert _validate_frontmatter(content) is None
+
+    def test_multiline_frontmatter_with_name_elsewhere_passes(self):
+        content = "---\nversion: 1.0\n\ndescription: |\n  A multi-line description.\nname: my-skill\n---\n# Content"
+        assert _validate_frontmatter(content) is None
+
 
 class TestValidateContentSize:
     def test_small_content_passes(self):
@@ -201,6 +209,17 @@ class TestCreate:
         result = _handle_create(temp_git_repo, "other-skill", content2)
         data = json.loads(result)
         assert "error" in data
+
+    def test_rejects_directory_basename_collision_across_categories(self, temp_git_repo):
+        # Create skills/devops/tools/
+        content1 = "---\nname: devops-tools\n---\n# DevOps tools"
+        _handle_create(temp_git_repo, "tools", content1, category="devops")
+        # Try to create skills/mlops/tools/ — same basename, different category
+        content2 = "---\nname: mlops-tools\n---\n# MLOps tools"
+        result = _handle_create(temp_git_repo, "tools", content2, category="mlops")
+        data = json.loads(result)
+        assert "error" in data
+        assert "collision" in data["error"].lower() or "already exists" in data["error"].lower()
         assert "already used" in data["error"].lower() or "collision" in data["error"].lower()
 
 
@@ -298,8 +317,6 @@ class TestFindRepoDir:
 
     def test_finds_repo_via_external_dirs(self, temp_git_repo):
         repo_path = str(temp_git_repo)
-        # cfg_get(cfg, *keys, default=...) returns default when key not found.
-        # Mock returns the repo path as an external_dir entry.
         def mock_cfg_get(cfg, *keys, default=None):
             key_path = ".".join(keys)
             if key_path == "skills.repo_dir":
@@ -310,3 +327,37 @@ class TestFindRepoDir:
         with patch("hermes_cli.config.cfg_get", side_effect=mock_cfg_get):
             result = _find_repo_dir()
             assert result is not None
+
+    def test_finds_repo_via_git_file_worktree(self, tmp_path):
+        # Create a valid git repo with .git as a file (git worktree)
+        main_repo = tmp_path / "main-repo"
+        main_repo.mkdir()
+        subprocess.run(["git", "init", "-b", "trunk"], cwd=str(main_repo), capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.test"], cwd=str(main_repo), capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(main_repo), capture_output=True)
+        (main_repo / "initial.txt").write_text("init")
+        subprocess.run(["git", "add", "initial.txt"], cwd=str(main_repo), capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(main_repo), capture_output=True)
+        subprocess.run(["git", "branch", "devel"], cwd=str(main_repo), capture_output=True)
+
+        # Create a linked worktree (produces .git as a file)
+        worktree_path = tmp_path / "worktree-checkout"
+        subprocess.run(
+            ["git", "worktree", "add", str(worktree_path), "devel"],
+            cwd=str(main_repo), capture_output=True
+        )
+        assert (worktree_path / ".git").is_file()  # worktree has .git as file
+
+        # mock config to return the worktree skills/ as external_dir
+        wt_skills = str(worktree_path / "skills")
+        def mock_cfg_get(cfg, *keys, default=None):
+            key_path = ".".join(keys)
+            if key_path == "skills.repo_dir":
+                return None
+            if key_path == "skills.external_dirs":
+                return [wt_skills]
+            return default
+        with patch("hermes_cli.config.cfg_get", side_effect=mock_cfg_get):
+            result = _find_repo_dir()
+            assert result is not None
+            assert result == worktree_path

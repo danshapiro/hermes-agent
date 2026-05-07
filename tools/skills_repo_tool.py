@@ -41,8 +41,8 @@ _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 # a 'name:' field. Full validation is deferred to the skill loader, but
 # this catches obvious malformed content early.
 _FRONTMATTER_MIN_RE = re.compile(
-    r"^---\s*\n.*\bname\s*:.*\n(?:.|\n)*?---\s*\n",
-    re.MULTILINE,
+    r"\A---\s*\n.*?\bname\s*:.+\n.*?---\s*\n",
+    re.DOTALL,
 )
 
 
@@ -53,9 +53,9 @@ def _find_repo_dir() -> Optional[Path]:
         cfg = load_config()
         repo_dir = cfg_get(cfg, "skills", "repo_dir")
         if repo_dir:
-            path = Path(str(repo_dir))
-            if (path / ".git").is_dir():
-                return path.resolve()
+            path = Path(str(repo_dir)).expanduser().resolve()
+            if (path / ".git").exists():
+                return path
     except Exception:
         pass
 
@@ -64,11 +64,11 @@ def _find_repo_dir() -> Optional[Path]:
         cfg = load_config()
         external_dirs = cfg_get(cfg, "skills", "external_dirs") or []
         for d in external_dirs:
-            p = Path(str(d))
+            p = Path(str(d)).expanduser().resolve()
             git_dir = p
             while git_dir != git_dir.parent:
-                if (git_dir / ".git").is_dir():
-                    return git_dir.resolve()
+                if (git_dir / ".git").exists():
+                    return git_dir
                 git_dir = git_dir.parent
     except Exception:
         pass
@@ -244,8 +244,9 @@ def _check_name_unique_in_repo(repo_dir: Path, name: str,
                                 frontmatter_name: Optional[str] = None) -> Optional[str]:
     """Check that name does not collide with an existing skill in the repo.
 
-    Checks path-based collisions (same directory) AND frontmatter-name
-    collisions (different directory but same 'name:' in YAML frontmatter).
+    Checks path-based collisions (same directory), directory-basename
+    collisions across categories, and frontmatter-name collisions
+    (different directory but same 'name:' in YAML frontmatter).
     When frontmatter_name differs from the directory name, both are checked.
     """
     # Path-based collision check
@@ -260,6 +261,24 @@ def _check_name_unique_in_repo(repo_dir: Path, name: str,
         skill_path = repo_dir / "skills" / name
         if skill_path.is_dir():
             return f"skill {name!r} already exists in the repo at skills/{name}/"
+
+    # Directory basename collision across categories (e.g. skills/cat1/foo/ + skills/cat2/foo/)
+    skills_root = repo_dir / "skills"
+    if skills_root.is_dir():
+        for d in skills_root.iterdir():
+            if d.is_dir() and d.name == name:
+                # Exact match: won't hit because path-based check above covers it
+                pass
+            elif d.is_dir():
+                # Check if this category directory has a subdirectory matching our name
+                sub = d / name
+                if category and d.name == category:
+                    continue  # same category, already checked by path-based check
+                if sub.is_dir():
+                    return (
+                        f"skill {name!r} already exists at skills/{d.name}/{name}/ "
+                        f"(directory basename collision across categories; choose a unique name)"
+                    )
 
     # Frontmatter-name collision check (different directory, same 'name:' in frontmatter)
     existing = _scan_all_skill_names(repo_dir)
