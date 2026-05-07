@@ -39,7 +39,11 @@ _MAX_CONTENT_SIZE = 256 * 1024  # 256 KiB
 
 
 def _find_repo_dir() -> Optional[Path]:
-    """Resolve the skills repo directory from config or external_dirs scan."""
+    """Resolve the skills repo directory from config ``skills.repo_dir`` only.
+
+    ``skills.external_dirs`` are read-only discovery inputs and must not be
+    treated as writable repo selectors.
+    """
     try:
         from hermes_cli.config import cfg_get, load_config
         cfg = load_config()
@@ -54,26 +58,6 @@ def _find_repo_dir() -> Optional[Path]:
             path = path.resolve()
             if (path / ".git").exists():
                 return path
-    except Exception:
-        pass
-
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        cfg = load_config()
-        external_dirs = cfg_get(cfg, "skills", "external_dirs") or []
-        for d in external_dirs:
-            raw = str(d)
-            expanded = os.path.expanduser(os.path.expandvars(raw))
-            p = Path(expanded)
-            if not p.is_absolute():
-                from hermes_constants import get_hermes_home
-                p = (get_hermes_home() / p)
-            p = p.resolve()
-            git_dir = p
-            while git_dir != git_dir.parent:
-                if (git_dir / ".git").exists():
-                    return git_dir
-                git_dir = git_dir.parent
     except Exception:
         pass
 
@@ -298,23 +282,26 @@ def _check_name_unique_in_repo(repo_dir: Path, name: str,
         if skill_path.is_dir():
             return f"skill {name!r} already exists in the repo at skills/{name}/"
 
-    # Directory basename collision across categories (e.g. skills/cat1/foo/ + skills/cat2/foo/)
+    # Directory basename collision across all category levels.
+    # Hermes resolves skills by directory basename for nested paths (e.g.
+    # skills/mlops/training/trl-fine-tuning/ maps to basename 'trl-fine-tuning').
     skills_root = repo_dir / "skills"
     if skills_root.is_dir():
-        for d in skills_root.iterdir():
-            if d.is_dir() and d.name == name:
-                # Exact match: won't hit because path-based check above covers it
-                pass
-            elif d.is_dir():
-                # Check if this category directory has a subdirectory matching our name
-                sub = d / name
-                if category and d.name == category:
-                    continue  # same category, already checked by path-based check
-                if sub.is_dir():
-                    return (
-                        f"skill {name!r} already exists at skills/{d.name}/{name}/ "
-                        f"(directory basename collision across categories; choose a unique name)"
-                    )
+        for d in skills_root.rglob("*"):
+            if not d.is_dir():
+                continue
+            if d.name != name:
+                continue
+            # Skip the exact target path (already rejected by path check above)
+            if category and d == skills_root / category / name:
+                continue
+            if not category and d == skills_root / name:
+                continue
+            rel_d = d.relative_to(repo_dir)
+            return (
+                f"skill {name!r} already exists at {rel_d}/ "
+                f"(directory basename collision; choose a unique name)"
+            )
 
     # Frontmatter-name collision check (different directory, same 'name:' in frontmatter)
     existing = _scan_all_skill_names(repo_dir)
