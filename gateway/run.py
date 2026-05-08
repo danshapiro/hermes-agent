@@ -1476,6 +1476,243 @@ class GatewayRunner:
                 f"{platform.value} connect timed out after {timeout:g}s"
             ) from exc
 
+    def _configure_platform_adapter(self, adapter: BasePlatformAdapter) -> None:
+        """Attach gateway callbacks shared by initial and recovery connects."""
+        adapter.set_message_handler(self._handle_message)
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+
+    def _adapter_receive_task(self, adapter: BasePlatformAdapter) -> Optional[asyncio.Task]:
+        """Return an adapter-owned receive task when a platform exposes one."""
+        task = getattr(adapter, "receive_task", None)
+        if task is None:
+            task = getattr(adapter, "_receive_task", None)
+        return task if isinstance(task, asyncio.Task) else None
+
+    def _watch_adapter_receive_task(
+        self,
+        adapter: BasePlatformAdapter,
+        platform: Platform,
+    ) -> None:
+        """Recover a platform when its adapter receive task dies after connect."""
+        task = self._adapter_receive_task(adapter)
+        if task is None:
+            return
+
+        watched = getattr(self, "_watched_adapter_receive_tasks", None)
+        if watched is None:
+            watched = set()
+            self._watched_adapter_receive_tasks = watched
+        task_id = id(task)
+        if task_id in watched:
+            return
+        watched.add(task_id)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            watched.discard(task_id)
+            self._on_adapter_receive_task_done(adapter, platform, done_task)
+
+        task.add_done_callback(_on_done)
+
+    def _watch_connected_adapter_receive_tasks(self) -> None:
+        """Ensure connected adapters are watched after startup becomes active."""
+        for platform, adapter in list(self.adapters.items()):
+            self._watch_adapter_receive_task(adapter, platform)
+
+    def _on_adapter_receive_task_done(
+        self,
+        adapter: BasePlatformAdapter,
+        platform: Platform,
+        task: asyncio.Task,
+    ) -> None:
+        """Schedule recovery when an active adapter's receive loop exits."""
+        if not getattr(self, "_running", False):
+            return
+        if self.adapters.get(platform) is not adapter:
+            return
+        current_task = self._adapter_receive_task(adapter)
+        if current_task is not None and current_task is not task and not current_task.done():
+            self._watch_adapter_receive_task(adapter, platform)
+            logger.info(
+                "%s adapter receive task rotated during reconnect; continuing with new receive task",
+                platform.value,
+            )
+            return
+        if task.cancelled():
+            return
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+
+        if exc is None:
+            logger.warning(
+                "%s adapter receive task exited unexpectedly; reconnecting adapter",
+                platform.value,
+            )
+        else:
+            logger.error(
+                "%s adapter receive task failed; reconnecting adapter: %s",
+                platform.value,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+        recovery_task = asyncio.create_task(
+            self._recover_dead_adapter(platform, adapter, exc)
+        )
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        background_tasks.add(recovery_task)
+        recovery_task.add_done_callback(background_tasks.discard)
+
+    async def _recover_dead_adapter(
+        self,
+        platform: Platform,
+        dead_adapter: BasePlatformAdapter,
+        cause: BaseException | None,
+    ) -> None:
+        """Replace an adapter whose receive task died after a successful connect."""
+        if self.adapters.get(platform) is not dead_adapter:
+            return
+
+        platform_config = self.config.platforms.get(platform)
+        if not platform_config or not platform_config.enabled:
+            logger.warning(
+                "%s adapter receive task died but the platform is no longer enabled",
+                platform.value,
+            )
+            self.adapters.pop(platform, None)
+            self.delivery_router.adapters = self.adapters
+            return
+
+        message = str(cause) if cause else "receive task exited"
+        self._update_platform_runtime_status(
+            platform.value,
+            platform_state="connecting",
+            error_code=getattr(cause, "__class__", type(cause)).__name__ if cause else None,
+            error_message=message,
+        )
+        logger.info("Recreating %s adapter after receive task stopped", platform.value)
+
+        try:
+            await dead_adapter.cancel_background_tasks()
+        except Exception as exc:
+            logger.debug(
+                "Defensive %s background-task cancel after receive task failure raised: %s",
+                platform.value,
+                exc,
+            )
+        try:
+            await dead_adapter.disconnect()
+        except Exception as exc:
+            logger.debug(
+                "Defensive %s disconnect after receive task failure raised: %s",
+                platform.value,
+                exc,
+            )
+        finally:
+            if self.adapters.get(platform) is dead_adapter:
+                self.adapters.pop(platform, None)
+                self.delivery_router.adapters = self.adapters
+
+        adapter = self._create_adapter(platform, platform_config)
+        if not adapter:
+            logger.warning(
+                "Reconnect %s after receive task failure: adapter creation returned None",
+                platform.value,
+            )
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="retrying",
+                error_code=None,
+                error_message="adapter creation returned None",
+            )
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 0,
+                "next_retry": time.monotonic() + 30,
+            }
+            return
+
+        self._configure_platform_adapter(adapter)
+        try:
+            success = await self._connect_adapter_with_timeout(adapter, platform)
+        except Exception as exc:
+            logger.warning(
+                "Reconnect %s after receive task failure raised: %s",
+                platform.value,
+                exc,
+            )
+            await self._safe_adapter_disconnect(adapter, platform)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="retrying",
+                error_code=getattr(exc, "__class__", type(exc)).__name__,
+                error_message=str(exc),
+            )
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 0,
+                "next_retry": time.monotonic() + 30,
+            }
+            return
+
+        if success:
+            self.adapters[platform] = adapter
+            self._sync_voice_mode_state_to_adapter(adapter)
+            self.delivery_router.adapters = self.adapters
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+            )
+            self._watch_adapter_receive_task(adapter, platform)
+            logger.info("✓ %s reconnected after receive task failure", platform.value)
+            try:
+                from gateway.channel_directory import build_channel_directory
+                await build_channel_directory(self.adapters)
+            except Exception:
+                pass
+            return
+
+        await self._safe_adapter_disconnect(adapter, platform)
+        error_message = adapter.fatal_error_message or "failed to reconnect"
+        if adapter.has_fatal_error and not adapter.fatal_error_retryable:
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="fatal",
+                error_code=adapter.fatal_error_code,
+                error_message=error_message,
+            )
+            logger.warning(
+                "Reconnect %s after receive task failure hit non-retryable error: %s",
+                platform.value,
+                error_message,
+            )
+            return
+
+        self._update_platform_runtime_status(
+            platform.value,
+            platform_state="retrying",
+            error_code=adapter.fatal_error_code,
+            error_message=error_message,
+        )
+        self._failed_platforms[platform] = {
+            "config": platform_config,
+            "attempts": 0,
+            "next_retry": time.monotonic() + 30,
+        }
+        logger.warning(
+            "Reconnect %s after receive task failure did not connect; queued for retry",
+            platform.value,
+        )
+
     @property
     def should_exit_cleanly(self) -> bool:
         return self._exit_cleanly
@@ -3131,10 +3368,7 @@ class GatewayRunner:
                 continue
             
             # Set up message + fatal error handlers
-            adapter.set_message_handler(self._handle_message)
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            self._configure_platform_adapter(adapter)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -3149,6 +3383,7 @@ class GatewayRunner:
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
+                    self._watch_adapter_receive_task(adapter, platform)
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -3253,6 +3488,7 @@ class GatewayRunner:
         self.delivery_router.adapters = self.adapters
         
         self._running = True
+        self._watch_connected_adapter_receive_tasks()
         self._update_runtime_status("running")
         
         # Emit gateway:startup hook
@@ -4052,16 +4288,14 @@ class GatewayRunner:
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._handle_message)
-                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                    adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    self._configure_platform_adapter(adapter)
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
+                        self._watch_adapter_receive_task(adapter, platform)
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
