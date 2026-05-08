@@ -422,6 +422,206 @@ class TestPlatformReconnectWatcher:
         assert Platform.TELEGRAM not in runner._failed_platforms
 
 
+class TestReceiveTaskRecovery:
+    """Test recovery when a connected adapter's receive loop dies."""
+
+    @pytest.mark.asyncio
+    async def test_receive_task_clean_exit_triggers_recovery_once(self):
+        """A cleanly-finished receive task should schedule adapter recovery once."""
+        runner = _make_runner()
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._background_tasks = set()
+        runner._recover_dead_adapter = AsyncMock()
+
+        async def clean_receive():
+            await asyncio.sleep(0)
+
+        adapter._receive_task = asyncio.create_task(clean_receive())
+        runner._watch_adapter_receive_task(adapter, Platform.TELEGRAM)
+
+        for _ in range(5):
+            if runner._background_tasks:
+                break
+            await asyncio.sleep(0)
+
+        recovery_tasks = list(runner._background_tasks)
+        assert len(recovery_tasks) == 1
+        await asyncio.gather(*recovery_tasks)
+
+        runner._recover_dead_adapter.assert_awaited_once()
+        args = runner._recover_dead_adapter.await_args.args
+        assert args[0] is Platform.TELEGRAM
+        assert args[1] is adapter
+        assert args[2] is None
+
+    @pytest.mark.asyncio
+    async def test_receive_task_cancelled_does_not_trigger_recovery(self):
+        """A cancelled receive task should not schedule adapter recovery."""
+        runner = _make_runner()
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._background_tasks = set()
+        runner._recover_dead_adapter = AsyncMock()
+
+        task = asyncio.create_task(asyncio.sleep(60))
+        adapter._receive_task = task
+        runner._watch_adapter_receive_task(adapter, Platform.TELEGRAM)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+
+        runner._recover_dead_adapter.assert_not_awaited()
+        assert not runner._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_startup_rewatch_recovers_task_that_died_before_running(self):
+        """A receive task that dies during startup should be rechecked once running."""
+        runner = _make_runner()
+        runner._running = False
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._background_tasks = set()
+        runner._recover_dead_adapter = AsyncMock()
+
+        async def clean_receive():
+            return None
+
+        adapter._receive_task = asyncio.create_task(clean_receive())
+        runner._watch_adapter_receive_task(adapter, Platform.TELEGRAM)
+
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert not runner._background_tasks
+        runner._recover_dead_adapter.assert_not_awaited()
+
+        runner._running = True
+        runner._watch_connected_adapter_receive_tasks()
+
+        for _ in range(5):
+            if runner._background_tasks:
+                break
+            await asyncio.sleep(0)
+
+        recovery_tasks = list(runner._background_tasks)
+        assert len(recovery_tasks) == 1
+        await asyncio.gather(*recovery_tasks)
+
+        runner._recover_dead_adapter.assert_awaited_once()
+        args = runner._recover_dead_adapter.await_args.args
+        assert args[0] is Platform.TELEGRAM
+        assert args[1] is adapter
+        assert args[2] is None
+
+    @pytest.mark.asyncio
+    async def test_receive_task_exception_triggers_recovery(self):
+        """A failed receive task should schedule adapter recovery immediately."""
+        runner = _make_runner()
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._background_tasks = set()
+        runner._recover_dead_adapter = AsyncMock()
+
+        async def fail_receive():
+            raise RuntimeError("bridge reconnect timed out")
+
+        adapter._receive_task = asyncio.create_task(fail_receive())
+        runner._watch_adapter_receive_task(adapter, Platform.TELEGRAM)
+
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        recovery_tasks = list(runner._background_tasks)
+        assert len(recovery_tasks) == 1
+        await asyncio.gather(*recovery_tasks)
+
+        runner._recover_dead_adapter.assert_awaited_once()
+        args = runner._recover_dead_adapter.await_args.args
+        assert args[0] is Platform.TELEGRAM
+        assert args[1] is adapter
+        assert isinstance(args[2], RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_receive_task_rotation_preserves_fast_reconnect(self):
+        """A cleanly replaced receive task should not trigger full adapter recovery."""
+        runner = _make_runner()
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._background_tasks = set()
+        runner._recover_dead_adapter = AsyncMock()
+
+        old_task = asyncio.create_task(asyncio.sleep(0))
+        new_task = asyncio.create_task(asyncio.sleep(60))
+        adapter._receive_task = old_task
+        runner._watch_adapter_receive_task(adapter, Platform.TELEGRAM)
+        adapter._receive_task = new_task
+
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            new_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await new_task
+
+        runner._recover_dead_adapter.assert_not_awaited()
+        assert not runner._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_recover_dead_adapter_replaces_with_fresh_connection(self):
+        """Recovery should tear down the dead adapter and connect a fresh one."""
+        runner = _make_runner()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._watch_adapter_receive_task = MagicMock()
+
+        dead_adapter = StubAdapter(platform=Platform.TELEGRAM)
+        teardown_events = []
+        dead_adapter.cancel_background_tasks = AsyncMock(
+            side_effect=lambda: teardown_events.append("cancel_background_tasks")
+        )
+
+        async def disconnect_dead_adapter():
+            teardown_events.append("disconnect")
+
+        dead_adapter.disconnect = AsyncMock(side_effect=disconnect_dead_adapter)
+        fresh_adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = dead_adapter
+        runner._create_adapter = MagicMock(return_value=fresh_adapter)
+        runner._connect_adapter_with_timeout = AsyncMock(return_value=True)
+
+        with patch(
+            "gateway.channel_directory.build_channel_directory",
+            new=AsyncMock(return_value={"platforms": {}}),
+        ):
+            await runner._recover_dead_adapter(
+                Platform.TELEGRAM,
+                dead_adapter,
+                RuntimeError("bridge reconnect timed out"),
+            )
+
+        dead_adapter.cancel_background_tasks.assert_awaited_once()
+        dead_adapter.disconnect.assert_awaited_once()
+        assert teardown_events == ["cancel_background_tasks", "disconnect"]
+        runner._create_adapter.assert_called_once_with(
+            Platform.TELEGRAM,
+            runner.config.platforms[Platform.TELEGRAM],
+        )
+        runner._connect_adapter_with_timeout.assert_awaited_once_with(
+            fresh_adapter,
+            Platform.TELEGRAM,
+        )
+        assert runner.adapters[Platform.TELEGRAM] is fresh_adapter
+        runner._sync_voice_mode_state_to_adapter.assert_called_once_with(fresh_adapter)
+        runner._watch_adapter_receive_task.assert_called_once_with(
+            fresh_adapter,
+            Platform.TELEGRAM,
+        )
+        assert runner.delivery_router.adapters is runner.adapters
+
+
 # --- Runtime disconnection queueing ---
 
 class TestRuntimeDisconnectQueuing:
