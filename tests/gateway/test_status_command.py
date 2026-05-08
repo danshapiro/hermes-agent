@@ -9,6 +9,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
+from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -633,3 +634,125 @@ async def test_post_delivery_callback_generation_snapshot_happens_after_bind():
     assert fired == []
     assert session_key in adapter._post_delivery_callbacks
     assert adapter._post_delivery_callbacks[session_key][0] == 2
+
+
+@pytest.mark.asyncio
+async def test_first_run_ringdown_skips_home_channel_onboarding(monkeypatch):
+    """Ringdown phone calls must never hear the home-channel setup notice.
+
+    Ringdown is a voice-ephemeral platform with no persistent chat channel.
+    The home-channel notice is meaningless and disruptive as audio.
+    """
+    import gateway.run as gateway_run
+
+    was_registered = platform_registry.is_registered("ringdown")
+    if not was_registered:
+        platform_registry.register(
+            PlatformEntry(
+                name="ringdown",
+                label="Ringdown",
+                adapter_factory=lambda _: None,
+                check_fn=lambda: True,
+                home_channel_supported=False,
+            )
+        )
+    ringdown = Platform("ringdown")
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(
+            SessionSource(
+                platform=ringdown,
+                user_id="phone:call-1",
+                chat_id="call-1",
+                user_name="phone",
+                chat_type="dm",
+            )
+        ),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=ringdown,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=ringdown)
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = False
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model": "openai/test-model",
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(
+        _make_event("hello", platform=ringdown)
+    )
+
+    assert result == "ok"
+    for call in runner.adapters[ringdown].send.await_args_list:
+        assert "No home channel is set for" not in str(call.args)
+
+    if not was_registered:
+        platform_registry.unregister("ringdown")
+
+
+@pytest.mark.asyncio
+async def test_first_run_discord_still_gets_home_channel_onboarding(monkeypatch):
+    """Built-in text platforms must still receive the home-channel notice.
+
+    The ringdown exclusion must not affect other platforms. Discord has
+    persistent channels and the notice is meaningful there.
+    """
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source(Platform.DISCORD)),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=Platform.DISCORD)
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = False
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model": "openai/test-model",
+        }
+    )
+
+    monkeypatch.delenv("DISCORD_HOME_CHANNEL", raising=False)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(
+        _make_event("hello", platform=Platform.DISCORD)
+    )
+
+    assert result == "ok"
+    runner.adapters[Platform.DISCORD].send.assert_awaited()
+    onboarding = runner.adapters[Platform.DISCORD].send.await_args.args[1]
+    assert "Type /sethome" in onboarding

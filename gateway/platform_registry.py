@@ -125,6 +125,12 @@ class PlatformEntry:
     # resolve the default chat/room ID.  Empty = no cron home-channel support.
     cron_deliver_env_var: str = ""
 
+    # ── Home channel ──
+    # Whether this platform supports a persistent home channel for cron
+    # results and cross-platform deliver. Voice/ephemeral platforms should
+    # set this to False so the gateway skips any onboarding notice.
+    home_channel_supported: bool = True
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.

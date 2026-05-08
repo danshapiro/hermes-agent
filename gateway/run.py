@@ -6848,10 +6848,19 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (not history and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK):
+            from gateway.platform_registry import platform_registry
+
             platform_name = source.platform.value
-            env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            entry = platform_registry.get(platform_name)
+            if entry is not None and not entry.home_channel_supported:
+                logger.debug(
+                    "Skipping home-channel notice for '%s' (home_channel_supported=False)",
+                    platform_name,
+                )
+            elif not os.getenv(_home_target_env_var(platform_name)):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
