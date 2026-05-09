@@ -862,6 +862,74 @@ def _build_child_progress_callback(
     return _callback
 
 
+# Maximum characters of skill content to transfer into a subagent's prompt.
+# Subagent system prompts are bounded; skills longer than this get a
+# truncation warning so the subagent knows its instructions may be incomplete.
+_MAX_SKILL_TRANSFER_CHARS = 10_000
+
+
+def _load_skill_bodies(skill_names: List[str]) -> List[Dict[str, Any]]:
+    """Read SKILL.md files from disk and return their bodies.
+
+    Uses hermes' own ``skill_view`` pipeline (platform filtering,
+    disabled-skill checks) but calls it with ``preprocess=False`` to
+    suppress side effects that are only appropriate for interactive
+    agent use (env passthrough registration, credential file
+    registration, interactive prompts).  Preloading is purely a data
+    injection — it should not mutate parent-agent global state.
+
+    Returns a list of dicts with keys:
+      - name (str): the skill name
+      - body (str): the SKILL.md content (possibly truncated)
+      - truncated (bool): whether the body exceeded _MAX_SKILL_TRANSFER_CHARS
+    """
+    from tools.skills_tool import skill_view as _skill_view
+
+    result: List[Dict[str, Any]] = []
+    if not skill_names:
+        return result
+
+    # Deduplicate skill names to avoid injecting content twice.
+    seen: set[str] = set()
+    unique_names: List[str] = []
+    for name in skill_names:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+
+    for name in unique_names:
+        try:
+            # preprocess=False: suppress side effects (env passthrough,
+            # credential file registration, interactive prompts) that
+            # skill_view normally runs for interactive agent use.
+            raw = _skill_view(name, preprocess=False)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict) or not parsed.get("success"):
+                logger.warning(
+                    "skill '%s' returned success=false during subagent "
+                    "skill preload; skipping.", name,
+                )
+                continue
+            content = parsed.get("content", "")
+            truncated = len(content) > _MAX_SKILL_TRANSFER_CHARS
+            body = content[:_MAX_SKILL_TRANSFER_CHARS]
+            if truncated:
+                body += "\n... [truncated]"
+            result.append({
+                "name": parsed.get("name", name),
+                "body": body,
+                "truncated": truncated,
+            })
+        except Exception as exc:
+            logger.warning(
+                "Failed to load skill '%s' for subagent preload: %s",
+                name, exc,
+            )
+            continue
+
+    return result
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -883,6 +951,14 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Skills to preload from disk into the subagent's context at startup.
+    # Skill names (e.g. ["gws-gmail", "using-familiar"]) cause SKILL.md
+    # files to be read from disk via hermes' own skill_view pipeline
+    # (same preprocessing, platform filtering, and disabled checks that
+    # agents use at runtime).  Full content is injected into the child's
+    # system prompt.  Subagents can still invoke skill_view for additional
+    # skills during execution.
+    skills: Optional[List[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -971,6 +1047,40 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
+
+    # Preload skills from disk into the subagent's context.
+    # Reads SKILL.md files via hermes' own skill_view pipeline (same
+    # preprocessing, platform filtering, disabled checks).  Full content
+    # is injected at startup so subagents don't waste their time budget
+    # rediscovering CLI syntax.  Subagents can still invoke skill_view
+    # at runtime for additional skills.
+    if skills:
+        skill_bodies = _load_skill_bodies(skills)
+        if skill_bodies:
+            truncated_warnings = []
+            for s in skill_bodies:
+                if s["truncated"]:
+                    truncated_warnings.append(s["name"])
+            header = (
+                "\n\n---\n"
+                "## Preloaded Skills\n"
+                "These skills have been preloaded into your context:\n"
+            )
+            if truncated_warnings:
+                names = ", ".join(truncated_warnings)
+                header += (
+                    f"\nWARNING: The following skill(s) were too long and "
+                    f"had to be truncated: {names}. The instructions you "
+                    f"received may be incomplete and your results may be "
+                    f"incorrect. You MUST tell the user that this task may "
+                    f"not have worked properly because the skill(s) were "
+                    f"truncated.\n"
+                )
+            header += "\n"
+            for s in skill_bodies:
+                header += f"## Skill: {s['name']}\n{s['body']}\n\n"
+            child_prompt += header
+
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -1161,15 +1271,21 @@ def _dump_subagent_timeout_diagnostic(
     duration_seconds: float,
     worker_thread: Optional[threading.Thread],
     goal: str,
+    child_api_calls: int = 0,
 ) -> Optional[str]:
-    """Write a structured diagnostic dump for a subagent that timed out
-    before making any API call.
+    """Write a structured diagnostic dump for a subagent that timed out.
 
     See issue #14726: users hit "subagent timed out after 300s with no response"
-    with zero API calls and no way to inspect what happened. This helper
-    writes a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log``
+    with zero API calls and no way to inspect what happened. Extended in the
+    Eugene Lin enrichment postmortem to cover ALL timeout cases, not just
+    0-API-call hangs.
+
+    Writes a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log``
     capturing the child's config, system-prompt / tool-schema sizes, activity
     tracker snapshot, and the worker thread's Python stack at timeout.
+
+    When ``child_api_calls`` > 0, the Notes section explains the likely cause
+    is task scope exceeding the timeout window rather than a transport hang.
 
     Returns the absolute path to the diagnostic file, or None on failure.
     """
@@ -1285,10 +1401,15 @@ def _dump_subagent_timeout_diagnostic(
         _w("")
 
         _w("## Notes")
-        _w("  This file is written ONLY when a subagent times out with 0 API calls.")
-        _w("  0-API-call timeouts mean the child never reached its first LLM request.")
-        _w("  Common causes: oversized prompt rejected by provider, transport hang,")
-        _w("  credential resolution stuck. See issue #14726 for context.")
+        if child_api_calls == 0:
+            _w("  0-API-call timeout: the child never reached its first LLM request.")
+            _w("  Common causes: oversized prompt rejected by provider, transport hang,")
+            _w("  credential resolution stuck. See issue #14726 for context.")
+        else:
+            _w(f"  {child_api_calls} API call(s) completed before timeout.")
+            _w("  Common causes: task scope too large for timeout window, too many")
+            _w("  sequential tool calls needed, or an external service was slow to")
+            _w("  respond. See Eugene Lin enrichment postmortem for context.")
 
         dump_path.write_text("\n".join(lines), encoding="utf-8")
         return str(dump_path)
@@ -1510,9 +1631,9 @@ def _run_single_child(
                 duration,
             )
 
-            # When a subagent times out BEFORE making any API call, dump a
-            # diagnostic to help users (and us) see what the child was doing.
-            # See #14726 — without this, 0-API-call hangs are black boxes.
+            # When a subagent times out, dump a diagnostic to help users
+            # (and us) see what the child was doing.  See #14726 and the
+            # Eugene Lin enrichment postmortem.
             diagnostic_path: Optional[str] = None
             child_api_calls = 0
             try:
@@ -1520,7 +1641,7 @@ def _run_single_child(
                 child_api_calls = int(_summary.get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            if is_timeout and child_api_calls == 0:
+            if is_timeout:
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
                     task_index=task_index,
@@ -1528,11 +1649,13 @@ def _run_single_child(
                     duration_seconds=float(duration),
                     worker_thread=_worker_thread_holder.get("t"),
                     goal=goal,
+                    child_api_calls=child_api_calls,
                 )
                 if diagnostic_path:
                     logger.warning(
-                        "Subagent %d 0-API-call timeout — diagnostic written to %s",
+                        "Subagent %d timeout (%d API calls) — diagnostic written to %s",
                         task_index,
+                        child_api_calls,
                         diagnostic_path,
                     )
 
@@ -1560,14 +1683,16 @@ def _run_single_child(
                         f"first LLM request (prompt construction, credential "
                         f"resolution, or transport may be stuck)."
                     )
-                    if diagnostic_path:
-                        _err += f" Diagnostic: {diagnostic_path}"
                 else:
                     _err = (
                         f"Subagent timed out after {child_timeout}s with "
                         f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call or unresponsive network request."
+                        f"task scope too large for the timeout window. Reduce "
+                        f"the number of sources/identifiers per subagent or "
+                        f"split into more parallel tasks."
                     )
+                if diagnostic_path:
+                    _err += f" Diagnostic: {diagnostic_path}"
             else:
                 _err = str(_timeout_exc)
 
@@ -1876,6 +2001,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    skills: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1963,7 +2089,7 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role, "skills": skills}
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2000,6 +2126,9 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task skills beats top-level skills.
+            # "skills": [] should mean "no skills" not "inherit from parent".
+            task_skills = t.get("skills") if "skills" in t else skills
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2022,6 +2151,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                skills=task_skills,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2463,7 +2593,18 @@ DELEGATE_TASK_SCHEMA = {
         "(default 2) and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
-        "- Results are always returned as an array, one entry per task."
+        "- Results are always returned as an array, one entry per task.\n"
+        "TIMEOUT AND TASK SIZING:\n"
+        "- Subagents time out after 600s (10 min) by default. Plan tasks accordingly.\n"
+        "- Single-source-family, single-identifier tasks complete reliably. "
+        "Multi-family, multi-identifier tasks do not.\n"
+        "- Example of good sizing: 'Search Gmail for emails from alice@example.com' "
+        "(single source, single query) — completes in ~2-4 min.\n"
+        "- Example of bad sizing: 'Search all sources for Alice across 5 email addresses' "
+        "(multi-source, multi-identifier) — will time out.\n"
+        "- When you have multiple sources or identifiers, use the 'tasks' array "
+        "to dispatch parallel subagents, one per source/identifier.\n"
+        "- If a subagent reports timeout, reduce scope and retry with fewer sources."
     ),
     "parameters": {
         "type": "object",
@@ -2491,9 +2632,11 @@ DELEGATE_TASK_SCHEMA = {
                     "Toolsets to enable for this subagent. "
                     "Default: inherits your enabled toolsets. "
                     f"Available toolsets: {_TOOLSET_LIST_STR}. "
+                    "IMPORTANT: 'web' = web_search + web_extract (full web research and scraping). "
+                    "'search' = web_search ONLY (no scraping, quick lookups). "
                     "Common patterns: ['terminal', 'file'] for code work, "
-                    "['web'] for research, ['browser'] for web interaction, "
-                    "['terminal', 'file', 'web'] for full-stack tasks."
+                    "['web'] for research, ['search'] for quick lookups, "
+                    "['browser'] for interactive web navigation."
                 ),
             },
             "tasks": {
@@ -2509,7 +2652,7 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                            "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. 'web'=search+extract, 'search'=search only. Use 'web' for research, 'search' for quick lookups, 'terminal' for shell, 'browser' for web interaction.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -2524,6 +2667,11 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "skills": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Per-task skills override. See top-level 'skills' for semantics.",
                         },
                     },
                     "required": ["goal"],
@@ -2548,6 +2696,19 @@ DELEGATE_TASK_SCHEMA = {
                     "(treated as 'leaf') when the child would exceed "
                     "max_spawn_depth or when "
                     "delegation.orchestrator_enabled=false."
+                ),
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Skills to preload from disk into this subagent's context at startup. "
+                    "List skill names (e.g. ['gws-gmail', 'using-familiar']) and the "
+                    "framework reads their SKILL.md files via hermes' own skill_view "
+                    "pipeline, injecting the full content into the subagent's system "
+                    "prompt. Subagents can still invoke skill_view to load additional "
+                    "skills at runtime. Use this to avoid subagents wasting their time "
+                    "budget rediscovering CLI syntax and tool patterns."
                 ),
             },
             "acp_command": {
@@ -2590,6 +2751,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        skills=args.get("skills"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

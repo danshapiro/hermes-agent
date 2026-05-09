@@ -220,11 +220,39 @@ $GAPI drive search "quarterly report" --max 10
 $GAPI drive search "mimeType='application/pdf'" --raw-query --max 5
 ```
 
+### Drive: Two-Step File Lookup
+
+Drive file lookup by name requires two steps — `files get` does NOT accept
+file names, only file IDs:
+
+```bash
+# Step 1: Search by name to get the file ID
+$GAPI drive search "Tokyo Splits" --max 10
+# Returns: [{id: "abc123", name: "Tokyo Splits", ...}]
+
+# Step 2: Get file contents with the ID
+$GAPI drive get abc123
+```
+
+Do NOT try `$GAPI drive get --params '{"fileId": "Tokyo Splits"}'` — it returns 404.
+
+### Drive: Binary Files
+
+Files with `application/octet-stream` or unknown MIME types cannot be inspected
+by any agent tool. These are typically binary blobs (compiled executables,
+encrypted archives, or proprietary formats). When a Drive search returns such
+files, note them in the briefing as "found but unreadable" and move on — do not
+retry the lookup.
+
 ### Contacts
 
 ```bash
 $GAPI contacts list --max 20
 ```
+
+> **Note:** The `gws people search contacts` command may return `policy_denied`
+> in some environments due to service broker configuration. When the broker
+> denies contacts access, skip the contacts-enrichment source family entirely.
 
 ### Sheets
 
@@ -245,9 +273,25 @@ $GAPI sheets append SHEET_ID "Sheet1!A:C" --values '[["new","row","data"]]'
 $GAPI docs get DOC_ID
 ```
 
+### Tasks
+
+The gws tasks CLI uses a `tasklists` subcommand (NOT `lists`):
+
+```bash
+# List task lists (CORRECT)
+gws tasks tasklists list
+
+# INCORRECT — do not use:
+# gws tasks lists list  # returns "unrecognized subcommand 'lists'"
+```
+
+Note: If `gws` is not installed, fall back to the Python API path via `$GAPI`.
+
 ## Output Format
 
-All commands return JSON. Parse with `jq` or read directly. Key fields:
+All commands return JSON. Parse with Python (`json.loads` or pipe through
+`python -c "import sys,json; data=json.load(sys.stdin); ..."`) — do NOT use `jq`
+as it is not installed in the agent container. Key fields:
 
 - **Gmail search**: `[{id, threadId, from, to, subject, date, snippet, labels}]`
 - **Gmail get**: `{id, threadId, from, to, subject, date, labels, body}`
@@ -265,6 +309,34 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 3. **Use the Gmail search syntax reference** for complex queries — load it with `skill_view("google-workspace", file_path="references/gmail-search-syntax.md")`.
 4. **Calendar times must include timezone** — always use ISO 8601 with offset (e.g., `2026-03-01T10:00:00-06:00`) or UTC (`Z`).
 5. **Respect rate limits** — avoid rapid-fire sequential API calls. Batch reads when possible.
+6. **Subagent timeout awareness** — subagents dispatched via `delegate_task` time out after 600s (10 min). Size subagent tasks accordingly: single-source, single-identifier tasks (e.g., "Search Gmail for alice@example.com") complete reliably in ~2-4 min. Multi-family, multi-identifier tasks will time out. When you have many sources, dispatch parallel single-source subagents instead of one monolithic task.
+
+## Web Search Fallback
+
+When the `web_search` tool is unavailable (postmortem #1) or search engines
+block with CAPTCHAs, use DuckDuckGo Lite (HTML-only endpoint, no JavaScript,
+no CAPTCHA). Parse results from the raw HTML with Python regex.
+
+```bash
+curl -sL "https://lite.duckduckgo.com/lite?q=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' 'search terms here')"
+```
+
+The HTML uses single quotes for attributes. Use regex that handles both
+single-quote and double-quote attribute styles:
+
+```python
+import re, subprocess, urllib.parse
+query = "eugene lin software engineer"
+url = f"https://lite.duckduckgo.com/lite?q={urllib.parse.quote(query)}"
+result = subprocess.run(["curl", "-sL", url], capture_output=True, text=True)
+links = re.findall(r"<a\s+class=['\"]result-link['\"][^>]*>([^<]+)<\/a>", result.stdout)
+snippets = re.findall(r"<td\s+class=['\"]result-snippet['\"][^>]*>([^<]+)<\/td>", result.stdout)
+```
+
+> **Note:** Email addresses alone (e.g. `eugene_lin@hotmail.com`) return zero
+> results on DuckDuckGo and other search engines. Do not use email addresses
+> as public-web search anchors — use names, handles, company names, or other
+> identifying information instead. (postmortem #15)
 
 ## Troubleshooting
 

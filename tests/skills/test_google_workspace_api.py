@@ -234,3 +234,56 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
     assert isinstance(creds, FakeCredentials)
     assert saved["token"] == "ya29.refreshed"
     assert saved["type"] == "authorized_user"
+
+
+def test_extract_message_body_strips_control_characters(api_module):
+    """Body text with control characters should be sanitized."""
+    import base64
+
+    raw_body = "Hello\x00\x01\x02\x03World\x1b\x1c\x1d\x1e\x1f!"
+    encoded = base64.urlsafe_b64encode(raw_body.encode("utf-8")).decode("ascii")
+
+    msg = {
+        "payload": {
+            "mimeType": "text/plain",
+            "body": {"data": encoded},
+        }
+    }
+
+    result = api_module._extract_message_body(msg)
+    assert "\x00" not in result
+    assert "\x01" not in result
+    assert "\x1b" not in result
+    assert "Hello" in result
+    assert "World!" in result
+
+    # Tabs, newlines, carriage returns should be preserved
+    raw_body2 = "Line1\tindented\nLine2\r\n"
+    encoded2 = base64.urlsafe_b64encode(raw_body2.encode("utf-8")).decode("ascii")
+    msg2 = {
+        "payload": {
+            "mimeType": "text/plain",
+            "body": {"data": encoded2},
+        }
+    }
+    result2 = api_module._extract_message_body(msg2)
+    assert "\t" in result2
+    assert "\n" in result2
+
+
+def test_run_gws_recovers_from_json_control_characters(api_module, monkeypatch):
+    """json.loads should recover when stdout contains control characters."""
+    import subprocess as _subprocess
+
+    # Simulate gws emitting JSON with a raw control char in a string value
+    dirty_json = '{"result": "hello\x1bworld"}'
+    mock_result = _subprocess.CompletedProcess(
+        args=["gws", "test"],
+        returncode=0,
+        stdout=dirty_json,
+        stderr="",
+    )
+    monkeypatch.setattr(api_module.subprocess, "run", lambda *a, **kw: mock_result)
+
+    result = api_module._run_gws(["gmail", "users", "messages", "get"], params={"id": "msg1"})
+    assert result["result"] == "helloworld"

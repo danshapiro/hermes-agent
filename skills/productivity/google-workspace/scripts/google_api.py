@@ -123,13 +123,27 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        print("ERROR: Unexpected non-JSON output from gws:", file=sys.stderr)
-        print(stdout, file=sys.stderr)
-        sys.exit(1)
+        # gws CLI may emit raw control characters in JSON string values
+        # that break Python's json parser. Strip them and retry once.
+        cleaned = _sanitize_body(stdout)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            print("ERROR: Unexpected non-JSON output from gws:", file=sys.stderr)
+            print(stdout, file=sys.stderr)
+            sys.exit(1)
 
 
 def _headers_dict(msg: dict) -> dict[str, str]:
     return {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+
+
+def _sanitize_body(text: str) -> str:
+    """Remove ASCII control characters except tab, newline, carriage return."""
+    return ''.join(
+        c for c in text
+        if c in ('\t', '\n', '\r') or ord(c) >= 0x20
+    )
 
 
 def _extract_message_body(msg: dict) -> str:
@@ -147,7 +161,7 @@ def _extract_message_body(msg: dict) -> str:
                 if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
                     body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
                     break
-    return body
+    return _sanitize_body(body)
 
 
 def _extract_doc_text(doc: dict) -> str:

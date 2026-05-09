@@ -2495,5 +2495,166 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestSkillInheritance(unittest.TestCase):
+    """Subagents can preload skills from disk via the 'skills' parameter."""
+
+    def test_skills_parameter_preloads_skill_content(self):
+        """Child prompt includes skill bodies when 'skills' is specified."""
+        parent = _make_mock_parent()
+        mock_bodies = [
+            {"name": "gws-gmail", "body": "# GWS Gmail\nUse `gws gmail`\n", "truncated": False},
+            {"name": "gws-calendar", "body": "# GWS Calendar\nUse `gws calendar`\n", "truncated": False},
+        ]
+
+        with patch(
+            "tools.delegate_tool._load_skill_bodies", return_value=mock_bodies
+        ), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Search gmail for eugene",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                skills=["gws-gmail", "gws-calendar"],
+            )
+
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs.get("ephemeral_system_prompt", "")
+
+        assert "Preloaded Skills" in prompt
+        assert "GWS Gmail" in prompt
+        assert "GWS Calendar" in prompt
+        assert "gws gmail" in prompt
+        assert "gws calendar" in prompt
+
+    def test_no_skills_parameter_no_preload_section(self):
+        """Without 'skills', the prompt has no Preloaded Skills section."""
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Search gmail",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+            )
+
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs.get("ephemeral_system_prompt", "")
+
+        assert "Preloaded Skills" not in prompt
+
+    def test_truncated_skill_adds_warning(self):
+        """Truncated skill bodies produce a warning in the child prompt."""
+        parent = _make_mock_parent()
+        long_body = "x" * 500
+        mock_bodies = [
+            {"name": "gws-huge", "body": long_body, "truncated": True},
+            {"name": "gws-small", "body": "short content", "truncated": False},
+        ]
+
+        with patch(
+            "tools.delegate_tool._load_skill_bodies", return_value=mock_bodies
+        ), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Search gmail",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                skills=["gws-huge", "gws-small"],
+            )
+
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs.get("ephemeral_system_prompt", "")
+
+        assert "truncated: gws-huge" in prompt
+        assert "You MUST tell the user" in prompt
+        assert "gws-small" in prompt
+        assert "short content" in prompt
+
+
+class TestLoadSkillBodies(unittest.TestCase):
+    """Unit tests for _load_skill_bodies — the disk-based skill loader."""
+
+    def test_real_truncation_at_10k_chars(self):
+        """Bodies exceeding _MAX_SKILL_TRANSFER_CHARS are truncated."""
+        from tools.delegate_tool import _load_skill_bodies, _MAX_SKILL_TRANSFER_CHARS
+
+        long_content = "a" * (_MAX_SKILL_TRANSFER_CHARS + 5000)
+        skill_json = json.dumps({
+            "success": True,
+            "name": "gws-huge",
+            "content": long_content,
+        })
+
+        with patch("tools.skills_tool.skill_view", return_value=skill_json):
+            result = _load_skill_bodies(["gws-huge"])
+
+        assert len(result) == 1
+        assert result[0]["name"] == "gws-huge"
+        assert result[0]["truncated"] is True
+        assert len(result[0]["body"]) == _MAX_SKILL_TRANSFER_CHARS + len("\n... [truncated]")
+        assert result[0]["body"].endswith("... [truncated]")
+
+    def test_short_content_not_truncated(self):
+        """Bodies under the limit pass through without truncation."""
+        from tools.delegate_tool import _load_skill_bodies
+
+        skill_json = json.dumps({
+            "success": True,
+            "name": "gws-short",
+            "content": "short skill content",
+        })
+
+        with patch("tools.skills_tool.skill_view", return_value=skill_json):
+            result = _load_skill_bodies(["gws-short"])
+
+        assert len(result) == 1
+        assert result[0]["truncated"] is False
+        assert result[0]["body"] == "short skill content"
+
+    def test_deduplicates_skill_names(self):
+        """Duplicate skill names are loaded only once."""
+        from tools.delegate_tool import _load_skill_bodies
+
+        call_count = [0]
+        def mock_skill_view(name, **kw):
+            call_count[0] += 1
+            return json.dumps({"success": True, "name": name, "content": "ok"})
+
+        with patch("tools.skills_tool.skill_view", side_effect=mock_skill_view):
+            result = _load_skill_bodies(["gws-gmail", "gws-gmail"])
+
+        assert len(result) == 1
+        assert call_count[0] == 1
+
+    def test_failed_skill_view_skipped_with_warning(self):
+        """A skill that returns success=false is skipped (logged)."""
+        from tools.delegate_tool import _load_skill_bodies
+
+        skill_json = json.dumps({"success": False, "error": "not found"})
+        ok_json = json.dumps({"success": True, "name": "gws-ok", "content": "ok"})
+
+        with patch("tools.skills_tool.skill_view", side_effect=[skill_json, ok_json]):
+            result = _load_skill_bodies(["gws-bad", "gws-ok"])
+
+        assert len(result) == 1
+        assert result[0]["name"] == "gws-ok"
+
+
 if __name__ == "__main__":
     unittest.main()
